@@ -1,0 +1,200 @@
+astronomy
+planets
+stars
+galaxies
+black holes
+comets
+the Moon
+the Sun
+Mars
+Saturn
+Jupiter
+Earth
+volcanoes
+earthquakes
+oceans
+rivers
+waterfalls
+deserts
+rainforests
+glaciers
+climate
+weather
+hurricanes
+tornadoes
+clouds
+lightning
+rainbows
+coral reefs
+mountains
+caves
+dinosaurs
+fossils
+whales
+dolphins
+sharks
+octopuses
+honeybees
+ants
+spiders
+butterflies
+eagles
+owls
+penguins
+frogs
+snakes
+tigers
+elephants
+wolves
+dogs
+cats
+bamboo
+oak trees
+roses
+sunflowers
+mushrooms
+bacteria
+viruses
+DNA
+cells
+the human brain
+the human heart
+sleep
+dreams
+memory
+nutrition
+exercise
+photosynthesis
+evolution
+ecosystems
+the water cycle
+the periodic table
+atoms
+molecules
+electricity
+magnetism
+gravity
+sound
+light
+heat
+time
+mathematics
+prime numbers
+geometry
+calculus
+statistics
+algorithms
+artificial intelligence
+machine learning
+robotics
+cybersecurity
+the internet
+blockchain
+video games
+virtual reality
+programming
+Python
+databases
+operating systems
+Linux
+space travel
+satellites
+telescopes
+microscopes
+ancient Egypt
+ancient Rome
+ancient Greece
+the Renaissance
+the printing press
+the Industrial Revolution
+World War I
+World War II
+the Cold War
+the Roman Empire
+the Silk Road
+pirates
+castles
+knights
+samurai
+vikings
+the Olympics
+democracy
+constitutions
+elections
+economics
+inflation
+trade
+banking
+taxes
+money
+maps
+cities
+bridges
+skyscrapers
+architecture
+painting
+sculpture
+photography
+music
+jazz
+classical music
+hip hop
+dance
+poetry
+novels
+libraries
+museums
+language
+translation
+education
+schools
+universities
+philosophy
+logic
+ethics
+psychology
+sociology
+archaeology
+medicine
+vaccines
+antibiotics
+surgery
+public health
+fire
+cooking
+bread
+coffee
+tea
+chocolate
+cheese
+fermentation
+gardening
+farming
+tractors
+trains
+airplanes
+helicopters
+cars
+bicycles
+ships
+submarines
+sports
+soccer
+basketball
+tennis
+swimming
+marathons
+chess
+puzzles
+myths
+dragons
+unicorns
+superheroes
+movies
+animation
+theater
+fashion
+clocks
+compasses
+paper
+glass
