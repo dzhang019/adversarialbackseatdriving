@@ -48,8 +48,7 @@ def generate_text(
     do_sample: bool = False,
     temperature: float = 1.0,
 ) -> str:
-    encoded = bundle.tokenizer(prompt, return_tensors="pt")
-    encoded = {key: value.to(bundle.device) for key, value in encoded.items()}
+    encoded = encode_chat_prompt(bundle, prompt, add_generation_prompt=True)
     generation_kwargs = {
         **encoded,
         "max_new_tokens": max_new_tokens,
@@ -89,21 +88,57 @@ def collect_last_token_residuals(
     prompt: str,
     response: str,
 ) -> torch.Tensor:
-    prompt_ids = bundle.tokenizer(prompt, return_tensors="pt")["input_ids"].to(bundle.device)
-    response_ids = bundle.tokenizer(response, add_special_tokens=False, return_tensors="pt")["input_ids"].to(bundle.device)
-    input_ids = torch.cat([prompt_ids, response_ids], dim=1)
-    attention_mask = torch.ones_like(input_ids, device=bundle.device)
+    prompt_inputs = encode_chat_prompt(bundle, prompt, add_generation_prompt=True)
     outputs = bundle.model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
+        input_ids=prompt_inputs["input_ids"],
+        attention_mask=prompt_inputs["attention_mask"],
         output_hidden_states=True,
         use_cache=False,
     )
-    last_index = input_ids.shape[1] - 1
+    # Use the final assistant-prefill token state, which predicts the first assistant response token.
+    last_index = prompt_inputs["input_ids"].shape[1] - 1
     return torch.stack(
         [hidden_state[0, last_index].detach().cpu() for hidden_state in outputs.hidden_states[1:]],
         dim=0,
     )
+
+
+@torch.no_grad()
+def collect_prompt_last_token_residuals(
+    bundle: TextModelBundle,
+    prompt: str,
+) -> torch.Tensor:
+    prompt_inputs = encode_chat_prompt(bundle, prompt, add_generation_prompt=True)
+    outputs = bundle.model(
+        input_ids=prompt_inputs["input_ids"],
+        attention_mask=prompt_inputs["attention_mask"],
+        output_hidden_states=True,
+        use_cache=False,
+    )
+    last_index = prompt_inputs["input_ids"].shape[1] - 1
+    return torch.stack(
+        [hidden_state[0, last_index].detach().cpu() for hidden_state in outputs.hidden_states[1:]],
+        dim=0,
+    )
+
+
+def encode_chat_prompt(
+    bundle: TextModelBundle,
+    prompt: str,
+    add_generation_prompt: bool = True,
+) -> dict[str, torch.Tensor]:
+    messages = [{"role": "user", "content": prompt}]
+    if hasattr(bundle.tokenizer, "apply_chat_template"):
+        encoded = bundle.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            return_tensors="pt",
+            return_dict=True,
+        )
+        return {key: value.to(bundle.device) for key, value in encoded.items()}
+
+    encoded = bundle.tokenizer(prompt, return_tensors="pt")
+    return {key: value.to(bundle.device) for key, value in encoded.items()}
 
 
 def load_concepts(path: str | Path) -> list[str]:

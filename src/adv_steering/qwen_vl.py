@@ -146,7 +146,8 @@ def collect_last_token_residuals(
         output_hidden_states=True,
         use_cache=False,
     )
-    last_index = input_ids.shape[1] - 1
+    # Use the final prompt token state, which is the state used to predict the first generated token.
+    last_index = prompt_inputs["input_ids"].shape[1] - 1
     return torch.stack(
         [hidden_state[0, last_index].detach().cpu() for hidden_state in outputs.hidden_states[1:]],
         dim=0,

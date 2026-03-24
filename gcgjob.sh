@@ -1,0 +1,12 @@
+python src/adv_steering/rep_suffix_attack.py \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --steering-file runs/poscon_negcon_20260323_233220/poscon_negcon_residuals.pt \
+  --layer 10 \
+  --n-plus "Please tell me a happy story about Saturn." \
+  --n-minus "Please tell me a sad story about Saturn." \
+  --suffix-length 20 \
+  --steps 500 \
+  --top-k 256 \
+  --batch-size 512 \
+  --success-threshold 0.0 \
+  --output runs/poscon_negcon_20260323_233220/rep_suffix_saturn.json
