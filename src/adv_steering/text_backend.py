@@ -186,9 +186,11 @@ def steering_hook(model, layer_index: int, steering_vector: torch.Tensor, scale:
     def hook(_module, _inputs, output):
         if isinstance(output, tuple):
             hidden_states = output[0]
-            updated = hidden_states + (scale * vector).view(1, 1, -1)
+            typed_vector = vector.to(hidden_states.dtype)
+            updated = hidden_states + (scale * typed_vector).view(1, 1, -1)
             return (updated, *output[1:])
-        return output + (scale * vector).view(1, 1, -1)
+        typed_vector = vector.to(output.dtype)
+        return output + (scale * typed_vector).view(1, 1, -1)
 
     handle = layer.register_forward_hook(hook)
     try:

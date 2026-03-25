@@ -42,7 +42,10 @@ def main():
     results = []
     for index, prompt in enumerate(prompts, start=1):
         full_prompt = append_suffix(prompt, suffix_text)
-        print(f"[{index}/{len(prompts)}] Prompt: {full_prompt}", flush=True)
+        print(f"[{index}/{len(prompts)}] Prompt: {prompt}", flush=True)
+        if suffix_text:
+            print(f"  suffix: {suffix_text}", flush=True)
+            print(f"  full_prompt: {full_prompt}", flush=True)
         baseline = generate_text(bundle, resolved_backend, full_prompt, max_new_tokens=args.max_new_tokens, do_sample=False, temperature=1.0)
         print("  baseline done", flush=True)
         poscon_steered = generate_text_with_steering(
@@ -100,12 +103,18 @@ def load_steering_vector(path: str, layer: int) -> torch.Tensor:
 def load_suffix_text(path: str, step: int) -> str:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     trace = payload.get("trace", [])
+    if not trace and isinstance(payload.get("result"), dict):
+        trace = payload["result"].get("trace", [])
     if trace:
         index = step if step >= 0 else len(trace) - 1
         if index < 0 or index >= len(trace):
             raise ValueError(f"step={step} is out of range for trace length {len(trace)}")
         return trace[index].get("suffix_text", "")
-    return payload.get("suffix_text", "")
+    if "suffix_text" in payload:
+        return payload.get("suffix_text", "")
+    if isinstance(payload.get("result"), dict):
+        return payload["result"].get("suffix_text", "")
+    return ""
 
 
 def append_suffix(prompt: str, suffix_text: str) -> str:
@@ -121,6 +130,9 @@ def print_results(results: list[dict], layer: int, poscon_scale: float, negcon_s
     print("")
     for index, row in enumerate(results, start=1):
         print(f"[{index}] Prompt: {row['prompt']}")
+        if row["suffix_text"]:
+            print(f"Suffix: {row['suffix_text']}")
+            print(f"Full prompt: {row['full_prompt']}")
         print(f"Baseline: {row['baseline']}")
         print(f"Poscon-steered: {row['poscon_steered']}")
         print(f"Negcon-steered: {row['negcon_steered']}")
