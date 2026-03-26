@@ -26,6 +26,8 @@ class RepSuffixStep:
     objective_term_1: float
     objective_term_2_name: str
     objective_term_2: float
+    objective_term_3_name: str
+    objective_term_3: float
     dot_product: float
     cosine_similarity: float
     next_token_kl: float | None
@@ -51,9 +53,10 @@ def parse_args():
     parser.add_argument("--n-minus", default="", help="Negative-concept prompt n-.")
     parser.add_argument("--neutral-prompt", default="", help="Neutral prompt for the steered cross-entropy objective.")
     parser.add_argument("--positive-prompt", default="", help="Positive-concept prompt for the steered cross-entropy objective.")
+    parser.add_argument("--negative-prompt", default="", help="Negative-concept prompt for the steered cross-entropy objective.")
     parser.add_argument("--neutral-target", default="", help="Teacher-forced target completion for the neutral prompt under steered_ce.")
-    parser.add_argument("--negative-target", default="", help="Teacher-forced target completion for the positive-prompt-plus-steering branch under steered_ce.")
-    parser.add_argument("--positive-target", default="", help="Deprecated alias for --negative-target.")
+    parser.add_argument("--positive-target", default="", help="Teacher-forced target completion for the negative-prompt-plus-negative-steering branch under steered_ce.")
+    parser.add_argument("--negative-target", default="", help="Teacher-forced target completion for the positive-prompt-plus-positive-steering branch under steered_ce.")
     parser.add_argument("--steering-scale", type=float, default=8.0, help="Scale of the steering vector used inside the steered cross-entropy objective.")
     parser.add_argument("--prompt-pairs-file", default="", help="Optional JSONL file with prompt pairs. Each row should contain n_plus/n_minus or poscon_prompt/negcon_prompt.")
     parser.add_argument("--steering-file", required=True, help="Path to poscon_negcon_residuals.pt or steering_candidates.pt.")
@@ -85,7 +88,9 @@ def optimize_suffix_against_direction(
     success_threshold: float = 0.0,
     kl_interval: int = 50,
     init_mode: str = "random",
+    neutral_prompt: str = "",
     neutral_target: str = "",
+    positive_target: str = "",
     negative_target: str = "",
     steering_scale: float = 8.0,
     forbidden_token_ids: set[int] | None = None,
@@ -109,14 +114,17 @@ def optimize_suffix_against_direction(
         for n_plus, n_minus in prompt_pairs
     ]
     target_ids = None
+    neutral_prompt_ids = None
     if objective_type == "steered_ce":
-        if not neutral_target or not negative_target:
-            raise ValueError("steered_ce requires both neutral_target and negative_target.")
+        if not neutral_prompt or not neutral_target or not positive_target or not negative_target:
+            raise ValueError("steered_ce requires neutral_prompt, neutral_target, positive_target, and negative_target.")
+        neutral_prompt_ids = encode_chat_prompt(bundle, neutral_prompt, add_generation_prompt=True)["input_ids"][0]
         target_ids = {
             "neutral": torch.tensor(tokenizer.encode(neutral_target, add_special_tokens=False), dtype=torch.long, device=device),
+            "positive": torch.tensor(tokenizer.encode(positive_target, add_special_tokens=False), dtype=torch.long, device=device),
             "negative": torch.tensor(tokenizer.encode(negative_target, add_special_tokens=False), dtype=torch.long, device=device),
         }
-        if target_ids["neutral"].numel() == 0 or target_ids["negative"].numel() == 0:
+        if target_ids["neutral"].numel() == 0 or target_ids["positive"].numel() == 0 or target_ids["negative"].numel() == 0:
             raise ValueError("steered_ce targets must tokenize to at least one token.")
 
     initial_prompt_pair_ids = prompt_pair_ids[:1]
@@ -137,6 +145,7 @@ def optimize_suffix_against_direction(
             layer=layer,
             objective_type=objective_type,
             target_ids=target_ids,
+            neutral_prompt_ids=neutral_prompt_ids,
             steering_scale=steering_scale,
             suffix_text="",
         ),
@@ -148,6 +157,7 @@ def optimize_suffix_against_direction(
             layer=layer,
             objective_type=objective_type,
             target_ids=target_ids,
+            neutral_prompt_ids=neutral_prompt_ids,
             steering_scale=steering_scale,
             suffix_text=tokenizer.decode(fill_suffix_token_ids, skip_special_tokens=True),
         ),
@@ -180,6 +190,7 @@ def optimize_suffix_against_direction(
             layer=layer,
             objective_type=objective_type,
             target_ids=target_ids,
+            neutral_prompt_ids=neutral_prompt_ids,
             steering_scale=steering_scale,
         )
 
@@ -216,6 +227,7 @@ def optimize_suffix_against_direction(
             layer=layer,
             objective_type=objective_type,
             target_ids=target_ids,
+            neutral_prompt_ids=neutral_prompt_ids,
             steering_scale=steering_scale,
         )
         best_batch_objective, best_batch_index = torch.min(batch_objectives, dim=0)
@@ -236,6 +248,7 @@ def optimize_suffix_against_direction(
             layer=layer,
             objective_type=objective_type,
             target_ids=target_ids,
+            neutral_prompt_ids=neutral_prompt_ids,
             steering_scale=steering_scale,
         )
         objective_breakdown = _aggregate_objective_breakdown(
@@ -246,6 +259,7 @@ def optimize_suffix_against_direction(
             layer=layer,
             objective_type=objective_type,
             target_ids=target_ids,
+            neutral_prompt_ids=neutral_prompt_ids,
             steering_scale=steering_scale,
         )
         dot_product = _aggregate_dot_product(
@@ -282,6 +296,8 @@ def optimize_suffix_against_direction(
                     objective_term_1=float(objective_breakdown["term_1"]),
                     objective_term_2_name=objective_breakdown["term_2_name"],
                     objective_term_2=float(objective_breakdown["term_2"]),
+                    objective_term_3_name=objective_breakdown["term_3_name"],
+                    objective_term_3=float(objective_breakdown["term_3"]),
                     dot_product=float(dot_product),
                     cosine_similarity=float(cosine_similarity),
                     next_token_kl=next_token_kl,
@@ -296,6 +312,7 @@ def optimize_suffix_against_direction(
             f"objective={candidate_best_objective:.6f} "
             f"{objective_breakdown['term_1_name']}={objective_breakdown['term_1']:.6f} "
             f"{objective_breakdown['term_2_name']}={objective_breakdown['term_2']:.6f} "
+            f"{objective_breakdown['term_3_name']}={objective_breakdown['term_3']:.6f} "
             f"dot_product={dot_product:.6f} "
             f"cosine_similarity={cosine_similarity:.6f} "
             f"next_token_kl={next_token_kl if next_token_kl is not None else 'NA'} "
@@ -322,6 +339,7 @@ def _aggregate_objective_and_suffix_grad(
     layer: int,
     objective_type: str,
     target_ids: dict[str, torch.Tensor] | None = None,
+    neutral_prompt_ids: torch.Tensor | None = None,
     steering_scale: float = 8.0,
 ) -> tuple[float, torch.Tensor]:
     model = bundle.model
@@ -334,14 +352,23 @@ def _aggregate_objective_and_suffix_grad(
         plus_prompt_embeds = torch.cat([n_plus_embeds, prefix_embeds], dim=1)
         minus_prompt_embeds = torch.cat([n_minus_embeds, prefix_embeds], dim=1)
         if objective_type == "steered_ce":
+            neutral_prompt_embeds = torch.cat([embedding_layer(neutral_prompt_ids.unsqueeze(0)).detach(), prefix_embeds], dim=1)
             objective = objective + _teacher_forced_ce_from_prompt_embeds(
                 bundle=bundle,
-                prompt_embeds=plus_prompt_embeds,
+                prompt_embeds=neutral_prompt_embeds,
                 target_token_ids=target_ids["neutral"],
             ).sum()
             objective = objective + _teacher_forced_ce_from_prompt_embeds(
                     bundle=bundle,
                     prompt_embeds=minus_prompt_embeds,
+                    target_token_ids=target_ids["positive"],
+                    steering_layer=layer,
+                    steering_vector=steering_vector,
+                    steering_scale=-steering_scale,
+            ).sum()
+            objective = objective + _teacher_forced_ce_from_prompt_embeds(
+                    bundle=bundle,
+                    prompt_embeds=plus_prompt_embeds,
                     target_token_ids=target_ids["negative"],
                     steering_layer=layer,
                     steering_vector=steering_vector,
@@ -379,6 +406,7 @@ def _aggregate_suffix_objective(
     layer: int,
     objective_type: str,
     target_ids: dict[str, torch.Tensor] | None = None,
+    neutral_prompt_ids: torch.Tensor | None = None,
     steering_scale: float = 8.0,
 ) -> float:
     embedding_layer = bundle.model.get_input_embeddings()
@@ -388,10 +416,11 @@ def _aggregate_suffix_objective(
         plus_embeds = torch.cat([embedding_layer(n_plus_ids.unsqueeze(0)), suffix_embeds], dim=1)
         minus_embeds = torch.cat([embedding_layer(n_minus_ids.unsqueeze(0)), suffix_embeds], dim=1)
         if objective_type == "steered_ce":
+            neutral_embeds = torch.cat([embedding_layer(neutral_prompt_ids.unsqueeze(0)), suffix_embeds], dim=1)
             total_objective += float(
                 _teacher_forced_ce_from_prompt_embeds(
                     bundle=bundle,
-                    prompt_embeds=plus_embeds,
+                    prompt_embeds=neutral_embeds,
                     target_token_ids=target_ids["neutral"],
                 )[0].item()
             )
@@ -399,6 +428,16 @@ def _aggregate_suffix_objective(
                 _teacher_forced_ce_from_prompt_embeds(
                     bundle=bundle,
                     prompt_embeds=minus_embeds,
+                    target_token_ids=target_ids["positive"],
+                    steering_layer=layer,
+                    steering_vector=steering_vector,
+                    steering_scale=-steering_scale,
+                )[0].item()
+            )
+            total_objective += float(
+                _teacher_forced_ce_from_prompt_embeds(
+                    bundle=bundle,
+                    prompt_embeds=plus_embeds,
                     target_token_ids=target_ids["negative"],
                     steering_layer=layer,
                     steering_vector=steering_vector,
@@ -429,6 +468,7 @@ def _batched_suffix_objectives(
     layer: int,
     objective_type: str,
     target_ids: dict[str, torch.Tensor] | None = None,
+    neutral_prompt_ids: torch.Tensor | None = None,
     steering_scale: float = 8.0,
 ) -> torch.Tensor:
     embedding_layer = bundle.model.get_input_embeddings()
@@ -442,14 +482,24 @@ def _batched_suffix_objectives(
         plus_embeds = torch.cat([plus_prefix, suffix_embeds], dim=1)
         minus_embeds = torch.cat([minus_prefix, suffix_embeds], dim=1)
         if objective_type == "steered_ce":
+            neutral_prefix = embedding_layer(neutral_prompt_ids.unsqueeze(0)).expand(batch_size, -1, -1)
+            neutral_embeds = torch.cat([neutral_prefix, suffix_embeds], dim=1)
             total_objectives += _teacher_forced_ce_from_prompt_embeds(
                 bundle=bundle,
-                prompt_embeds=plus_embeds,
+                prompt_embeds=neutral_embeds,
                 target_token_ids=target_ids["neutral"],
             ).float()
             total_objectives += _teacher_forced_ce_from_prompt_embeds(
                 bundle=bundle,
                 prompt_embeds=minus_embeds,
+                target_token_ids=target_ids["positive"],
+                steering_layer=layer,
+                steering_vector=steering_vector,
+                steering_scale=-steering_scale,
+            ).float()
+            total_objectives += _teacher_forced_ce_from_prompt_embeds(
+                bundle=bundle,
+                prompt_embeds=plus_embeds,
                 target_token_ids=target_ids["negative"],
                 steering_layer=layer,
                 steering_vector=steering_vector,
@@ -478,21 +528,24 @@ def _aggregate_objective_breakdown(
     layer: int,
     objective_type: str,
     target_ids: dict[str, torch.Tensor] | None = None,
+    neutral_prompt_ids: torch.Tensor | None = None,
     steering_scale: float = 8.0,
 ) -> dict[str, float | str]:
     embedding_layer = bundle.model.get_input_embeddings()
     suffix_embeds = embedding_layer(suffix_token_ids.unsqueeze(0))
     term_1 = 0.0
     term_2 = 0.0
+    term_3 = 0.0
 
     for n_plus_ids, n_minus_ids in prompt_pair_ids:
         plus_embeds = torch.cat([embedding_layer(n_plus_ids.unsqueeze(0)), suffix_embeds], dim=1)
         minus_embeds = torch.cat([embedding_layer(n_minus_ids.unsqueeze(0)), suffix_embeds], dim=1)
         if objective_type == "steered_ce":
+            neutral_embeds = torch.cat([embedding_layer(neutral_prompt_ids.unsqueeze(0)), suffix_embeds], dim=1)
             term_1 += float(
                 _teacher_forced_ce_from_prompt_embeds(
                     bundle=bundle,
-                    prompt_embeds=plus_embeds,
+                    prompt_embeds=neutral_embeds,
                     target_token_ids=target_ids["neutral"],
                 )[0].item()
             )
@@ -500,6 +553,16 @@ def _aggregate_objective_breakdown(
                 _teacher_forced_ce_from_prompt_embeds(
                     bundle=bundle,
                     prompt_embeds=minus_embeds,
+                    target_token_ids=target_ids["positive"],
+                    steering_layer=layer,
+                    steering_vector=steering_vector,
+                    steering_scale=-steering_scale,
+                )[0].item()
+            )
+            term_3 += float(
+                _teacher_forced_ce_from_prompt_embeds(
+                    bundle=bundle,
+                    prompt_embeds=plus_embeds,
                     target_token_ids=target_ids["negative"],
                     steering_layer=layer,
                     steering_vector=steering_vector,
@@ -518,14 +581,18 @@ def _aggregate_objective_breakdown(
         return {
             "term_1_name": "neutral_ce",
             "term_1": term_1,
-            "term_2_name": "steered_negative_ce",
+            "term_2_name": "negative_prompt_positive_target_ce",
             "term_2": term_2,
+            "term_3_name": "positive_prompt_negative_target_ce",
+            "term_3": term_3,
         }
     return {
         "term_1_name": "plus_projection",
         "term_1": term_1,
         "term_2_name": "minus_projection_negated",
         "term_2": term_2,
+        "term_3_name": "unused_term",
+        "term_3": term_3,
     }
 
 
@@ -538,6 +605,7 @@ def _per_prompt_objectives(
     layer: int,
     objective_type: str,
     target_ids: dict[str, torch.Tensor] | None = None,
+    neutral_prompt_ids: torch.Tensor | None = None,
     steering_scale: float = 8.0,
 ) -> list[float]:
     embedding_layer = bundle.model.get_input_embeddings()
@@ -547,10 +615,11 @@ def _per_prompt_objectives(
         plus_embeds = torch.cat([embedding_layer(n_plus_ids.unsqueeze(0)), suffix_embeds], dim=1)
         minus_embeds = torch.cat([embedding_layer(n_minus_ids.unsqueeze(0)), suffix_embeds], dim=1)
         if objective_type == "steered_ce":
+            neutral_embeds = torch.cat([embedding_layer(neutral_prompt_ids.unsqueeze(0)), suffix_embeds], dim=1)
             prompt_objective = float(
                 _teacher_forced_ce_from_prompt_embeds(
                     bundle=bundle,
-                    prompt_embeds=plus_embeds,
+                    prompt_embeds=neutral_embeds,
                     target_token_ids=target_ids["neutral"],
                 )[0].item()
             )
@@ -558,6 +627,16 @@ def _per_prompt_objectives(
                 _teacher_forced_ce_from_prompt_embeds(
                     bundle=bundle,
                     prompt_embeds=minus_embeds,
+                    target_token_ids=target_ids["positive"],
+                    steering_layer=layer,
+                    steering_vector=steering_vector,
+                    steering_scale=-steering_scale,
+                )[0].item()
+            )
+            prompt_objective += float(
+                _teacher_forced_ce_from_prompt_embeds(
+                    bundle=bundle,
+                    prompt_embeds=plus_embeds,
                     target_token_ids=target_ids["negative"],
                     steering_layer=layer,
                     steering_vector=steering_vector,
@@ -635,11 +714,14 @@ def _average_next_token_kl(
     bundle: TextModelBundle,
     prompt_pair_ids: list[tuple[torch.Tensor, torch.Tensor]],
     suffix_token_ids: torch.Tensor,
+    neutral_prompt_ids: torch.Tensor | None = None,
 ) -> float:
     kls = []
     for n_plus_ids, n_minus_ids in prompt_pair_ids:
         kls.append(_prompt_next_token_kl(bundle, n_plus_ids, suffix_token_ids))
         kls.append(_prompt_next_token_kl(bundle, n_minus_ids, suffix_token_ids))
+    if neutral_prompt_ids is not None:
+        kls.append(_prompt_next_token_kl(bundle, neutral_prompt_ids, suffix_token_ids))
     return float(sum(kls) / len(kls))
 
 
@@ -672,6 +754,7 @@ def _compute_suffix_metrics(
     layer: int,
     objective_type: str,
     target_ids: dict[str, torch.Tensor] | None,
+    neutral_prompt_ids: torch.Tensor | None,
     steering_scale: float,
     suffix_text: str,
 ) -> dict:
@@ -683,6 +766,7 @@ def _compute_suffix_metrics(
         layer=layer,
         objective_type=objective_type,
         target_ids=target_ids,
+        neutral_prompt_ids=neutral_prompt_ids,
         steering_scale=steering_scale,
     )
     return {
@@ -695,12 +779,15 @@ def _compute_suffix_metrics(
             layer=layer,
             objective_type=objective_type,
             target_ids=target_ids,
+            neutral_prompt_ids=neutral_prompt_ids,
             steering_scale=steering_scale,
         ),
         "objective_term_1_name": breakdown["term_1_name"],
         "objective_term_1": breakdown["term_1"],
         "objective_term_2_name": breakdown["term_2_name"],
         "objective_term_2": breakdown["term_2"],
+        "objective_term_3_name": breakdown["term_3_name"],
+        "objective_term_3": breakdown["term_3"],
         "dot_product": _aggregate_dot_product(
             bundle=bundle,
             prompt_pair_ids=prompt_pair_ids,
@@ -719,6 +806,7 @@ def _compute_suffix_metrics(
             bundle=bundle,
             prompt_pair_ids=prompt_pair_ids,
             suffix_token_ids=suffix_token_ids,
+            neutral_prompt_ids=neutral_prompt_ids,
         ),
     }
 
@@ -732,6 +820,7 @@ def _print_baselines(objective_type: str, baselines: dict) -> None:
         f"no_suffix_objective={no_suffix['objective']:.6f} "
         f"{no_suffix['objective_term_1_name']}={no_suffix['objective_term_1']:.6f} "
         f"{no_suffix['objective_term_2_name']}={no_suffix['objective_term_2']:.6f} "
+        f"{no_suffix['objective_term_3_name']}={no_suffix['objective_term_3']:.6f} "
         f"no_suffix_dot_product={no_suffix['dot_product']:.6f} "
         f"no_suffix_cosine_similarity={no_suffix['cosine_similarity']:.6f}",
         flush=True,
@@ -741,6 +830,7 @@ def _print_baselines(objective_type: str, baselines: dict) -> None:
         f"fill_suffix_objective={fill_suffix['objective']:.6f} "
         f"{fill_suffix['objective_term_1_name']}={fill_suffix['objective_term_1']:.6f} "
         f"{fill_suffix['objective_term_2_name']}={fill_suffix['objective_term_2']:.6f} "
+        f"{fill_suffix['objective_term_3_name']}={fill_suffix['objective_term_3']:.6f} "
         f"fill_suffix_dot_product={fill_suffix['dot_product']:.6f} "
         f"fill_suffix_cosine_similarity={fill_suffix['cosine_similarity']:.6f} "
         f"fill_suffix={fill_suffix['suffix_text']!r}",
@@ -912,15 +1002,14 @@ def _initialize_suffix_token_ids(
 
 def main():
     args = parse_args()
-    negative_target = args.negative_target or args.positive_target
     bundle = load_text_model_bundle(args.model, dtype=args.dtype, device_map=args.device_map)
     steering_vector = load_steering_vector(args.steering_file, args.layer)
     prompt_pairs = load_prompt_pairs(
         prompt_pairs_file=args.prompt_pairs_file,
         n_plus=args.n_plus,
         n_minus=args.n_minus,
-        neutral_prompt=args.neutral_prompt,
         positive_prompt=args.positive_prompt,
+        negative_prompt=args.negative_prompt,
     )
     result = optimize_suffix_against_direction(
         bundle=bundle,
@@ -935,17 +1024,22 @@ def main():
         success_threshold=args.success_threshold,
         kl_interval=args.kl_interval,
         init_mode=args.init_mode,
+        neutral_prompt=args.neutral_prompt,
         neutral_target=args.neutral_target,
-        negative_target=negative_target,
+        positive_target=args.positive_target,
+        negative_target=args.negative_target,
         steering_scale=args.steering_scale,
     )
 
     payload = {
         "layer": result.layer,
         "objective_type": result.objective_type,
+        "neutral_prompt": args.neutral_prompt,
+        "positive_prompt": args.positive_prompt,
+        "negative_prompt": args.negative_prompt,
         "neutral_target": args.neutral_target,
-        "negative_target": negative_target,
         "positive_target": args.positive_target,
+        "negative_target": args.negative_target,
         "steering_scale": args.steering_scale,
         "suffix_token_ids": result.suffix_token_ids,
         "suffix_text": result.suffix_text,
@@ -966,8 +1060,8 @@ def load_prompt_pairs(
     prompt_pairs_file: str,
     n_plus: str,
     n_minus: str,
-    neutral_prompt: str = "",
     positive_prompt: str = "",
+    negative_prompt: str = "",
 ) -> list[tuple[str, str]]:
     if prompt_pairs_file:
         rows = []
@@ -997,10 +1091,10 @@ def load_prompt_pairs(
             raise ValueError(f"No prompt pairs found in {prompt_pairs_file}")
         return rows
 
-    if neutral_prompt and positive_prompt:
-        return [(neutral_prompt, positive_prompt)]
+    if positive_prompt and negative_prompt:
+        return [(positive_prompt, negative_prompt)]
     if not n_plus or not n_minus:
-        raise ValueError("Provide either --prompt-pairs-file, both --neutral-prompt and --positive-prompt, or both --n-plus and --n-minus.")
+        raise ValueError("Provide either --prompt-pairs-file, both --positive-prompt and --negative-prompt, or both --n-plus and --n-minus.")
     return [(n_plus, n_minus)]
 
 
