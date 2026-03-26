@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -21,6 +22,10 @@ class RepSuffixStep:
     step: int
     objective_type: str
     objective: float
+    objective_term_1_name: str
+    objective_term_1: float
+    objective_term_2_name: str
+    objective_term_2: float
     dot_product: float
     cosine_similarity: float
     next_token_kl: float | None
@@ -233,6 +238,16 @@ def optimize_suffix_against_direction(
             target_ids=target_ids,
             steering_scale=steering_scale,
         )
+        objective_breakdown = _aggregate_objective_breakdown(
+            bundle=bundle,
+            prompt_pair_ids=active_prompt_pair_ids,
+            suffix_token_ids=suffix_token_ids,
+            steering_vector=steering_vector.to(device),
+            layer=layer,
+            objective_type=objective_type,
+            target_ids=target_ids,
+            steering_scale=steering_scale,
+        )
         dot_product = _aggregate_dot_product(
             bundle=bundle,
             prompt_pair_ids=active_prompt_pair_ids,
@@ -263,6 +278,10 @@ def optimize_suffix_against_direction(
                     step=step_index,
                     objective_type=objective_type,
                     objective=float(candidate_best_objective),
+                    objective_term_1_name=objective_breakdown["term_1_name"],
+                    objective_term_1=float(objective_breakdown["term_1"]),
+                    objective_term_2_name=objective_breakdown["term_2_name"],
+                    objective_term_2=float(objective_breakdown["term_2"]),
                     dot_product=float(dot_product),
                     cosine_similarity=float(cosine_similarity),
                     next_token_kl=next_token_kl,
@@ -275,6 +294,8 @@ def optimize_suffix_against_direction(
             f"[step {step_index + 1}/{steps}] "
             f"objective_type={objective_type} "
             f"objective={candidate_best_objective:.6f} "
+            f"{objective_breakdown['term_1_name']}={objective_breakdown['term_1']:.6f} "
+            f"{objective_breakdown['term_2_name']}={objective_breakdown['term_2']:.6f} "
             f"dot_product={dot_product:.6f} "
             f"cosine_similarity={cosine_similarity:.6f} "
             f"next_token_kl={next_token_kl if next_token_kl is not None else 'NA'} "
@@ -449,6 +470,66 @@ def _batched_suffix_objectives(
 
 
 @torch.no_grad()
+def _aggregate_objective_breakdown(
+    bundle: TextModelBundle,
+    prompt_pair_ids: list[tuple[torch.Tensor, torch.Tensor]],
+    suffix_token_ids: torch.Tensor,
+    steering_vector: torch.Tensor,
+    layer: int,
+    objective_type: str,
+    target_ids: dict[str, torch.Tensor] | None = None,
+    steering_scale: float = 8.0,
+) -> dict[str, float | str]:
+    embedding_layer = bundle.model.get_input_embeddings()
+    suffix_embeds = embedding_layer(suffix_token_ids.unsqueeze(0))
+    term_1 = 0.0
+    term_2 = 0.0
+
+    for n_plus_ids, n_minus_ids in prompt_pair_ids:
+        plus_embeds = torch.cat([embedding_layer(n_plus_ids.unsqueeze(0)), suffix_embeds], dim=1)
+        minus_embeds = torch.cat([embedding_layer(n_minus_ids.unsqueeze(0)), suffix_embeds], dim=1)
+        if objective_type == "steered_ce":
+            term_1 += float(
+                _teacher_forced_ce_from_prompt_embeds(
+                    bundle=bundle,
+                    prompt_embeds=plus_embeds,
+                    target_token_ids=target_ids["neutral"],
+                )[0].item()
+            )
+            term_2 += float(
+                _teacher_forced_ce_from_prompt_embeds(
+                    bundle=bundle,
+                    prompt_embeds=minus_embeds,
+                    target_token_ids=target_ids["negative"],
+                    steering_layer=layer,
+                    steering_vector=steering_vector,
+                    steering_scale=steering_scale,
+                )[0].item()
+            )
+            continue
+
+        plus_state = _last_token_hidden_from_embeds(bundle=bundle, prompt_embeds=plus_embeds, layer=layer)
+        minus_state = _last_token_hidden_from_embeds(bundle=bundle, prompt_embeds=minus_embeds, layer=layer)
+        typed_steering_vector = steering_vector.to(plus_state.dtype)
+        term_1 += float(torch.dot(typed_steering_vector, plus_state).item())
+        term_2 += float((-torch.dot(typed_steering_vector, minus_state)).item())
+
+    if objective_type == "steered_ce":
+        return {
+            "term_1_name": "neutral_ce",
+            "term_1": term_1,
+            "term_2_name": "steered_negative_ce",
+            "term_2": term_2,
+        }
+    return {
+        "term_1_name": "plus_projection",
+        "term_1": term_1,
+        "term_2_name": "minus_projection_negated",
+        "term_2": term_2,
+    }
+
+
+@torch.no_grad()
 def _per_prompt_objectives(
     bundle: TextModelBundle,
     prompt_pair_ids: list[tuple[torch.Tensor, torch.Tensor]],
@@ -594,6 +675,16 @@ def _compute_suffix_metrics(
     steering_scale: float,
     suffix_text: str,
 ) -> dict:
+    breakdown = _aggregate_objective_breakdown(
+        bundle=bundle,
+        prompt_pair_ids=prompt_pair_ids,
+        suffix_token_ids=suffix_token_ids,
+        steering_vector=steering_vector,
+        layer=layer,
+        objective_type=objective_type,
+        target_ids=target_ids,
+        steering_scale=steering_scale,
+    )
     return {
         "suffix_text": suffix_text,
         "objective": _aggregate_suffix_objective(
@@ -606,6 +697,10 @@ def _compute_suffix_metrics(
             target_ids=target_ids,
             steering_scale=steering_scale,
         ),
+        "objective_term_1_name": breakdown["term_1_name"],
+        "objective_term_1": breakdown["term_1"],
+        "objective_term_2_name": breakdown["term_2_name"],
+        "objective_term_2": breakdown["term_2"],
         "dot_product": _aggregate_dot_product(
             bundle=bundle,
             prompt_pair_ids=prompt_pair_ids,
@@ -635,6 +730,8 @@ def _print_baselines(objective_type: str, baselines: dict) -> None:
         "[baseline] "
         f"objective_type={objective_type} "
         f"no_suffix_objective={no_suffix['objective']:.6f} "
+        f"{no_suffix['objective_term_1_name']}={no_suffix['objective_term_1']:.6f} "
+        f"{no_suffix['objective_term_2_name']}={no_suffix['objective_term_2']:.6f} "
         f"no_suffix_dot_product={no_suffix['dot_product']:.6f} "
         f"no_suffix_cosine_similarity={no_suffix['cosine_similarity']:.6f}",
         flush=True,
@@ -642,6 +739,8 @@ def _print_baselines(objective_type: str, baselines: dict) -> None:
     print(
         "[baseline] "
         f"fill_suffix_objective={fill_suffix['objective']:.6f} "
+        f"{fill_suffix['objective_term_1_name']}={fill_suffix['objective_term_1']:.6f} "
+        f"{fill_suffix['objective_term_2_name']}={fill_suffix['objective_term_2']:.6f} "
         f"fill_suffix_dot_product={fill_suffix['dot_product']:.6f} "
         f"fill_suffix_cosine_similarity={fill_suffix['cosine_similarity']:.6f} "
         f"fill_suffix={fill_suffix['suffix_text']!r}",
@@ -856,8 +955,11 @@ def main():
         "prompt_pairs": [{"n_plus": n_plus, "n_minus": n_minus} for n_plus, n_minus in prompt_pairs],
     }
     print(json.dumps(payload, indent=2))
-    if args.output:
-        Path(args.output).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    output_path = resolve_output_path(args.output, args.steering_file)
+    if output_path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(f"Saved suffix artifact to {output_path}", flush=True)
 
 
 def load_prompt_pairs(
@@ -900,6 +1002,25 @@ def load_prompt_pairs(
     if not n_plus or not n_minus:
         raise ValueError("Provide either --prompt-pairs-file, both --neutral-prompt and --positive-prompt, or both --n-plus and --n-minus.")
     return [(n_plus, n_minus)]
+
+
+def resolve_output_path(output: str, steering_file: str) -> Path | None:
+    if output:
+        return Path(output)
+    run_dir = infer_run_dir(steering_file)
+    if run_dir is None:
+        return None
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return run_dir / "suffixes" / f"rep_suffix_{timestamp}.json"
+
+
+def infer_run_dir(artifact_path: str) -> Path | None:
+    path = Path(artifact_path)
+    if not path.parts:
+        return None
+    if path.parent.name in {"suffixes", "steering_generations"}:
+        return path.parent.parent
+    return path.parent
 
 
 if __name__ == "__main__":

@@ -38,6 +38,20 @@ def generate_text_with_steering(bundle, backend: str, prompt: str, layer: int, s
     return text_backend.generate_text_with_steering(bundle, prompt, layer=layer, steering_vector=steering_vector, scale=scale, max_new_tokens=max_new_tokens, do_sample=do_sample, temperature=temperature)
 
 
+def generate_text_with_top_logits(bundle, backend: str, prompt: str, max_new_tokens: int, top_k: int, steering_vector=None, layer: int | None = None, scale: float = 0.0):
+    if backend == "qwen_vl":
+        raise ValueError("Top-logit tracing is currently only supported for the causal_lm backend.")
+    return text_backend.generate_text_with_top_logits(
+        bundle,
+        prompt,
+        max_new_tokens=max_new_tokens,
+        top_k=top_k,
+        steering_vector=steering_vector,
+        layer=layer,
+        scale=scale,
+    )
+
+
 def collect_last_token_residuals(bundle, backend: str, prompt: str, response: str):
     if backend == "qwen_vl":
         return qwen_vl.collect_last_token_residuals(bundle, prompt, response)

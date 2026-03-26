@@ -83,6 +83,71 @@ def generate_text_with_steering(
 
 
 @torch.no_grad()
+def generate_text_with_top_logits(
+    bundle: TextModelBundle,
+    prompt: str,
+    max_new_tokens: int = 64,
+    top_k: int = 10,
+    steering_vector: torch.Tensor | None = None,
+    layer: int | None = None,
+    scale: float = 0.0,
+) -> dict[str, Any]:
+    encoded = encode_chat_prompt(bundle, prompt, add_generation_prompt=True)
+    input_ids = encoded["input_ids"]
+    attention_mask = encoded["attention_mask"]
+    generated_token_ids: list[int] = []
+    trace: list[dict[str, Any]] = []
+
+    context = (
+        steering_hook(bundle.model, layer, steering_vector.to(bundle.device), scale)
+        if steering_vector is not None and layer is not None
+        else null_hook()
+    )
+    with context:
+        for position in range(max_new_tokens):
+            outputs = bundle.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+            )
+            logits = outputs.logits[0, -1]
+            top_values, top_indices = torch.topk(logits.float(), k=min(top_k, logits.shape[-1]))
+            next_token_id = int(torch.argmax(logits).item())
+            generated_token_ids.append(next_token_id)
+            trace.append(
+                {
+                    "position": position,
+                    "generated_token_id": next_token_id,
+                    "generated_token_text": bundle.tokenizer.decode([next_token_id], skip_special_tokens=False),
+                    "generated_token_in_top_k": bool((top_indices == next_token_id).any().item()),
+                    "top_logits": [
+                        {
+                            "rank": rank + 1,
+                            "token_id": int(token_id.item()),
+                            "token_text": bundle.tokenizer.decode([int(token_id.item())], skip_special_tokens=False),
+                            "logit": float(logit.item()),
+                            "is_generated": int(token_id.item()) == next_token_id,
+                        }
+                        for rank, (token_id, logit) in enumerate(zip(top_indices, top_values))
+                    ],
+                }
+            )
+            next_token_tensor = torch.tensor([[next_token_id]], device=bundle.device, dtype=input_ids.dtype)
+            input_ids = torch.cat([input_ids, next_token_tensor], dim=1)
+            attention_mask = torch.cat(
+                [attention_mask, torch.ones((1, 1), device=bundle.device, dtype=attention_mask.dtype)],
+                dim=1,
+            )
+            if next_token_id == bundle.tokenizer.eos_token_id:
+                break
+
+    return {
+        "text": bundle.tokenizer.decode(generated_token_ids, skip_special_tokens=True).strip(),
+        "token_trace": trace,
+    }
+
+
+@torch.no_grad()
 def collect_last_token_residuals(
     bundle: TextModelBundle,
     prompt: str,
@@ -197,3 +262,8 @@ def steering_hook(model, layer_index: int, steering_vector: torch.Tensor, scale:
         yield
     finally:
         handle.remove()
+
+
+@contextmanager
+def null_hook():
+    yield
