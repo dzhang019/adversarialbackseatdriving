@@ -112,6 +112,7 @@ def generate_text_with_top_logits(
             )
             logits = outputs.logits[0, -1]
             top_values, top_indices = torch.topk(logits.float(), k=min(top_k, logits.shape[-1]))
+            top_probabilities = torch.softmax(top_values, dim=-1)
             next_token_id = int(torch.argmax(logits).item())
             generated_token_ids.append(next_token_id)
             trace.append(
@@ -126,9 +127,10 @@ def generate_text_with_top_logits(
                             "token_id": int(token_id.item()),
                             "token_text": bundle.tokenizer.decode([int(token_id.item())], skip_special_tokens=False),
                             "logit": float(logit.item()),
+                            "probability": float(probability.item()),
                             "is_generated": int(token_id.item()) == next_token_id,
                         }
-                        for rank, (token_id, logit) in enumerate(zip(top_indices, top_values))
+                        for rank, (token_id, logit, probability) in enumerate(zip(top_indices, top_values, top_probabilities))
                     ],
                 }
             )

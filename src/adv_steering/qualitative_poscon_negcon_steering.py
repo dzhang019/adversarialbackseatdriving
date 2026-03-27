@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 from datetime import datetime
 import json
 from pathlib import Path
@@ -35,6 +36,7 @@ def parse_args():
     parser.add_argument("--show-top-logits", action="store_true", help="Print the top next-token logits at each generation step.")
     parser.add_argument("--top-logits-k", type=int, default=10, help="How many logits to print per generation step when --show-top-logits is enabled.")
     parser.add_argument("--response-targets", default="", help="Optional JSON file with fixed positive/neutral/negative responses for teacher-forced CE scoring.")
+    parser.add_argument("--exact-suffix-ids", action="store_true", help="Use suffix_token_ids from the suffix artifact directly instead of re-tokenizing suffix_text. Only supported for causal_lm.")
     parser.add_argument("--output", default="", help="Optional path to save results as JSON.")
     return parser.parse_args()
 
@@ -44,18 +46,47 @@ def main():
     prompts = load_prompts(args.prompts)
     output_path = resolve_output_path(args.output, args.steering_file)
     suffix_path = resolve_suffix_path(args.suffix, output_path.parent if output_path else None) if args.suffix else ""
-    suffix_text = load_suffix_text(suffix_path, args.step) if suffix_path else ""
+    suffix_info = load_suffix_artifact(suffix_path, args.step, args.exact_suffix_ids) if suffix_path else {"suffix_text": "", "suffix_token_ids": None}
+    suffix_text = suffix_info["suffix_text"]
+    suffix_token_ids = suffix_info["suffix_token_ids"]
     response_targets = load_response_targets(args.response_targets) if args.response_targets else None
     steering_vector = load_steering_vector(args.steering_file, args.layer)
     bundle, resolved_backend = load_bundle(model_name=args.model, backend=args.backend, dtype=args.dtype, device_map=args.device_map)
+    if args.exact_suffix_ids and resolved_backend != "causal_lm":
+        raise ValueError("--exact-suffix-ids is currently only supported for the causal_lm backend.")
+
+    metadata = {
+        "model": args.model,
+        "backend": resolved_backend,
+        "steering_file": args.steering_file,
+        "layer": args.layer,
+        "poscon_scale": args.poscon_scale,
+        "negcon_scale": args.negcon_scale,
+        "prompts_path": args.prompts,
+        "suffix_path": suffix_path,
+        "step": args.step,
+        "dtype": args.dtype,
+        "device_map": args.device_map,
+        "max_new_tokens": args.max_new_tokens,
+        "show_top_logits": args.show_top_logits,
+        "top_logits_k": args.top_logits_k,
+        "response_targets_path": args.response_targets,
+        "response_targets": response_targets,
+        "exact_suffix_ids": args.exact_suffix_ids,
+        "suffix_text": suffix_text,
+        "suffix_token_ids": suffix_token_ids,
+    }
 
     results = []
     for index, prompt in enumerate(prompts, start=1):
-        full_prompt = append_suffix(prompt, suffix_text)
+        full_prompt = prompt if args.exact_suffix_ids else append_suffix(prompt, suffix_text)
         print(f"[{index}/{len(prompts)}] Prompt: {prompt}", flush=True)
         if suffix_text:
             print(f"  suffix: {suffix_text}", flush=True)
-            print(f"  full_prompt: {full_prompt}", flush=True)
+            if args.exact_suffix_ids:
+                print("  full_prompt: <prompt plus exact suffix token ids>", flush=True)
+            else:
+                print(f"  full_prompt: {full_prompt}", flush=True)
         baseline, baseline_trace = generate_generation_result(
             bundle=bundle,
             backend=resolved_backend,
@@ -63,6 +94,7 @@ def main():
             max_new_tokens=args.max_new_tokens,
             show_top_logits=args.show_top_logits,
             top_logits_k=args.top_logits_k,
+            suffix_token_ids=suffix_token_ids,
         )
         print("  baseline done", flush=True)
         poscon_steered, poscon_trace = generate_generation_result(
@@ -75,6 +107,7 @@ def main():
             steering_vector=steering_vector,
             layer=args.layer,
             scale=args.poscon_scale,
+            suffix_token_ids=suffix_token_ids,
         )
         print("  poscon-steered done", flush=True)
         negcon_steered, negcon_trace = generate_generation_result(
@@ -87,6 +120,7 @@ def main():
             steering_vector=steering_vector,
             layer=args.layer,
             scale=args.negcon_scale,
+            suffix_token_ids=suffix_token_ids,
         )
         print("  negcon-steered done", flush=True)
         if args.show_top_logits:
@@ -101,6 +135,7 @@ def main():
                     backend=resolved_backend,
                     prompt=full_prompt,
                     response_targets=response_targets,
+                    suffix_token_ids=suffix_token_ids,
                 ),
                 "poscon_steered": compute_response_target_cross_entropy(
                     bundle=bundle,
@@ -110,6 +145,7 @@ def main():
                     steering_vector=steering_vector,
                     layer=args.layer,
                     scale=args.poscon_scale,
+                    suffix_token_ids=suffix_token_ids,
                 ),
                 "negcon_steered": compute_response_target_cross_entropy(
                     bundle=bundle,
@@ -119,6 +155,7 @@ def main():
                     steering_vector=steering_vector,
                     layer=args.layer,
                     scale=args.negcon_scale,
+                    suffix_token_ids=suffix_token_ids,
                 ),
             }
             print_target_cross_entropy(target_cross_entropy)
@@ -127,6 +164,7 @@ def main():
                 "prompt": prompt,
                 "suffix_text": suffix_text,
                 "full_prompt": full_prompt,
+                "used_exact_suffix_ids": args.exact_suffix_ids,
                 "baseline": baseline,
                 "poscon_steered": poscon_steered,
                 "negcon_steered": negcon_steered,
@@ -142,12 +180,12 @@ def main():
         )
         if output_path:
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+            output_path.write_text(json.dumps({"metadata": metadata, "results": results}, indent=2), encoding="utf-8")
 
     print_results(results, args.layer, args.poscon_scale, args.negcon_scale)
     if output_path:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+        output_path.write_text(json.dumps({"metadata": metadata, "results": results}, indent=2), encoding="utf-8")
         print(f"Saved qualitative outputs to {output_path}", flush=True)
 
 
@@ -220,6 +258,30 @@ def load_suffix_text(path: str, step: int) -> str:
     return ""
 
 
+def load_suffix_artifact(path: str, step: int, exact_suffix_ids: bool) -> dict:
+    if not path:
+        return {"suffix_text": "", "suffix_token_ids": None}
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not exact_suffix_ids:
+        return {"suffix_text": load_suffix_text(path, step), "suffix_token_ids": None}
+    if not isinstance(payload, dict):
+        raise ValueError("--exact-suffix-ids requires a dict-shaped suffix artifact with suffix_token_ids.")
+    if step not in (-1, None):
+        trace = payload.get("trace", [])
+        final_index = len(trace) - 1 if trace else -1
+        if step != final_index:
+            raise ValueError("Exact suffix ids are only available for the final saved suffix. Use --step -1 or omit --step.")
+    suffix_token_ids = payload.get("suffix_token_ids")
+    if suffix_token_ids is None and isinstance(payload.get("result"), dict):
+        suffix_token_ids = payload["result"].get("suffix_token_ids")
+    if suffix_token_ids is None:
+        raise ValueError("Suffix artifact does not contain suffix_token_ids needed for --exact-suffix-ids.")
+    suffix_text = payload.get("suffix_text", "")
+    if not suffix_text and isinstance(payload.get("result"), dict):
+        suffix_text = payload["result"].get("suffix_text", "")
+    return {"suffix_text": suffix_text, "suffix_token_ids": suffix_token_ids}
+
+
 def resolve_output_path(output: str, steering_file: str) -> Path | None:
     if output:
         return Path(output)
@@ -268,6 +330,7 @@ def compute_response_target_cross_entropy(
     steering_vector: torch.Tensor | None = None,
     layer: int | None = None,
     scale: float = 0.0,
+    suffix_token_ids: list[int] | None = None,
 ) -> dict[str, float]:
     if backend != "causal_lm":
         raise ValueError("Fixed-response cross-entropy scoring is currently only supported for the causal_lm backend.")
@@ -280,6 +343,7 @@ def compute_response_target_cross_entropy(
             steering_vector=steering_vector,
             layer=layer,
             scale=scale,
+            suffix_token_ids=suffix_token_ids,
         )
     return scores
 
@@ -292,10 +356,18 @@ def compute_teacher_forced_cross_entropy(
     steering_vector: torch.Tensor | None = None,
     layer: int | None = None,
     scale: float = 0.0,
+    suffix_token_ids: list[int] | None = None,
 ) -> float:
     prompt_inputs = encode_chat_prompt(bundle, prompt, add_generation_prompt=True)
     prompt_ids = prompt_inputs["input_ids"]
     attention_mask = prompt_inputs["attention_mask"]
+    if suffix_token_ids is not None:
+        suffix_tensor = torch.tensor(suffix_token_ids, dtype=prompt_ids.dtype, device=bundle.device).unsqueeze(0)
+        prompt_ids = torch.cat([prompt_ids, suffix_tensor], dim=1)
+        attention_mask = torch.cat(
+            [attention_mask, torch.ones((1, suffix_tensor.shape[1]), device=bundle.device, dtype=attention_mask.dtype)],
+            dim=1,
+        )
     target_ids = bundle.tokenizer(response_text, add_special_tokens=False, return_tensors="pt")["input_ids"].to(bundle.device)
     full_input_ids = torch.cat([prompt_ids, target_ids], dim=1)
     full_attention_mask = torch.cat(
@@ -335,7 +407,21 @@ def generate_generation_result(
     steering_vector: torch.Tensor | None = None,
     layer: int | None = None,
     scale: float = 0.0,
+    suffix_token_ids: list[int] | None = None,
 ) -> tuple[str, list[dict]]:
+    if suffix_token_ids is not None:
+        return generate_generation_result_from_suffix_ids(
+            bundle=bundle,
+            backend=backend,
+            prompt=prompt,
+            suffix_token_ids=suffix_token_ids,
+            max_new_tokens=max_new_tokens,
+            show_top_logits=show_top_logits,
+            top_logits_k=top_logits_k,
+            steering_vector=steering_vector,
+            layer=layer,
+            scale=scale,
+        )
     if show_top_logits:
         traced = generate_text_with_top_logits(
             bundle=bundle,
@@ -366,6 +452,60 @@ def generate_generation_result(
     )
 
 
+def generate_generation_result_from_suffix_ids(
+    bundle,
+    backend: str,
+    prompt: str,
+    suffix_token_ids: list[int],
+    max_new_tokens: int,
+    show_top_logits: bool,
+    top_logits_k: int,
+    steering_vector: torch.Tensor | None = None,
+    layer: int | None = None,
+    scale: float = 0.0,
+) -> tuple[str, list[dict]]:
+    if backend != "causal_lm":
+        raise ValueError("Exact suffix ids are currently only supported for causal_lm.")
+    prompt_inputs = encode_chat_prompt(bundle, prompt, add_generation_prompt=True)
+    input_ids = prompt_inputs["input_ids"]
+    attention_mask = prompt_inputs["attention_mask"]
+    suffix_tensor = torch.tensor(suffix_token_ids, dtype=input_ids.dtype, device=bundle.device).unsqueeze(0)
+    input_ids = torch.cat([input_ids, suffix_tensor], dim=1)
+    attention_mask = torch.cat(
+        [attention_mask, torch.ones((1, suffix_tensor.shape[1]), dtype=attention_mask.dtype, device=bundle.device)],
+        dim=1,
+    )
+    if show_top_logits:
+        traced = generate_text_with_top_logits_from_input_ids(
+            bundle=bundle,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            top_k=top_logits_k,
+            steering_vector=steering_vector,
+            layer=layer,
+            scale=scale,
+        )
+        return traced["text"], traced["token_trace"]
+
+    generation_kwargs = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "max_new_tokens": max_new_tokens,
+        "do_sample": False,
+        "pad_token_id": bundle.tokenizer.pad_token_id,
+    }
+    context = (
+        steering_hook(bundle.model, layer, steering_vector.to(bundle.device), scale)
+        if steering_vector is not None and layer is not None
+        else null_hook()
+    )
+    with context:
+        generated = bundle.model.generate(**generation_kwargs)
+    new_tokens = generated[0][input_ids.shape[1] :]
+    return bundle.tokenizer.decode(new_tokens, skip_special_tokens=True).strip(), []
+
+
 def print_token_trace(label: str, token_trace: list[dict]) -> None:
     if not token_trace:
         return
@@ -382,7 +522,8 @@ def print_token_trace(label: str, token_trace: list[dict]) -> None:
                 f"      {marker} rank={candidate['rank']} "
                 f"token={candidate['token_text']!r} "
                 f"id={candidate['token_id']} "
-                f"logit={candidate['logit']:.6f}",
+                f"logit={candidate['logit']:.6f} "
+                f"probability={candidate.get('probability', float('nan')):.6f}",
                 flush=True,
             )
 
@@ -406,7 +547,9 @@ def token_trace_to_table(token_trace: list[dict]) -> dict[str, dict[str, dict]]:
         table[step_key] = {}
         generated_id = row["generated_token_id"]
         logits = [candidate["logit"] for candidate in row["top_logits"]]
-        probabilities = softmax(logits)
+        probabilities = [candidate.get("probability") for candidate in row["top_logits"]]
+        if any(probability is None for probability in probabilities):
+            probabilities = softmax(logits)
         for candidate, probability in zip(row["top_logits"], probabilities):
             rank_key = f"rank_{candidate['rank']}"
             table[step_key][rank_key] = {
@@ -434,6 +577,72 @@ class null_hook:
 
     def __exit__(self, exc_type, exc, tb):
         return False
+
+
+@torch.no_grad()
+def generate_text_with_top_logits_from_input_ids(
+    bundle,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    max_new_tokens: int = 64,
+    top_k: int = 10,
+    steering_vector: torch.Tensor | None = None,
+    layer: int | None = None,
+    scale: float = 0.0,
+) -> dict:
+    generated_token_ids: list[int] = []
+    trace: list[dict] = []
+    current_input_ids = input_ids
+    current_attention_mask = attention_mask
+    context = (
+        steering_hook(bundle.model, layer, steering_vector.to(bundle.device), scale)
+        if steering_vector is not None and layer is not None
+        else null_hook()
+    )
+    with context:
+        for position in range(max_new_tokens):
+            outputs = bundle.model(
+                input_ids=current_input_ids,
+                attention_mask=current_attention_mask,
+                use_cache=False,
+            )
+            logits = outputs.logits[0, -1]
+            top_values, top_indices = torch.topk(logits.float(), k=min(top_k, logits.shape[-1]))
+            top_probabilities = torch.softmax(top_values, dim=-1)
+            next_token_id = int(torch.argmax(logits).item())
+            generated_token_ids.append(next_token_id)
+            trace.append(
+                {
+                    "position": position,
+                    "generated_token_id": next_token_id,
+                    "generated_token_text": bundle.tokenizer.decode([next_token_id], skip_special_tokens=False),
+                    "generated_token_in_top_k": bool((top_indices == next_token_id).any().item()),
+                    "top_logits": [
+                        {
+                            "rank": rank + 1,
+                            "token_id": int(token_id.item()),
+                            "token_text": bundle.tokenizer.decode([int(token_id.item())], skip_special_tokens=False),
+                            "logit": float(logit.item()),
+                            "probability": float(probability.item()),
+                            "is_generated": int(token_id.item()) == next_token_id,
+                        }
+                        for rank, (token_id, logit, probability) in enumerate(zip(top_indices, top_values, top_probabilities))
+                    ],
+                }
+            )
+            next_token_tensor = torch.tensor([[next_token_id]], device=bundle.device, dtype=current_input_ids.dtype)
+            current_input_ids = torch.cat([current_input_ids, next_token_tensor], dim=1)
+            current_attention_mask = torch.cat(
+                [current_attention_mask, torch.ones((1, 1), device=bundle.device, dtype=current_attention_mask.dtype)],
+                dim=1,
+            )
+            if next_token_id == bundle.tokenizer.eos_token_id:
+                break
+
+    return {
+        "text": bundle.tokenizer.decode(generated_token_ids, skip_special_tokens=True).strip(),
+        "token_trace": trace,
+    }
 
 
 def print_results(results: list[dict], layer: int, poscon_scale: float, negcon_scale: float) -> None:

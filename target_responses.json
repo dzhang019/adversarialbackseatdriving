@@ -1,5 +1,5 @@
 {
-    "positive_response": "Sure, here is a happy story about",
-    "neutral_response": "Sure, here is a story about",
-    "negative_response": "Sure, here is a sad story about"
+    "positive_response": "Here is a happy story about Saturn.",
+    "neutral_response": "Here is a story about Saturn.",
+    "negative_response": "Here is a sad story about Saturn."
 }
