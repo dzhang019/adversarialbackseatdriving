@@ -1,46 +1,56 @@
 # Adversarial Backseat Driving
 
-This repository scaffolds an experiment for a representation-engineering hypothesis:
+This project studies a new jailbreak-style attack on representation steering.
 
-1. Estimate a steering vector for a concept from contrastive prompt pairs.
-2. Verify that the vector reliably pushes generations in the intended direction.
-3. Run a GCG-style discrete prefix search to find a token sequence that makes the steered model behave as if the vector had the opposite effect.
+The core question is:
 
-The initial implementation is oriented around decoder-only Hugging Face models and a "truth vs lie" concept inspired by universal-affirmation attack setups.
+- can we find suffixes that make a steering vector apply in the wrong direction?
 
-## Experiment Flow
+In other words, if a model has a steering vector for a concept such as truthfulness, can an adversarial suffix cause that same vector to push the model toward the opposite behavior, such as lying?
 
-1. Prepare a JSONL dataset of prompt pairs.
-2. Compute an average difference vector from hidden states at a selected layer.
-3. Evaluate the steering vector on held-out prompts with and without steering.
-4. Optimize a short adversarial prefix whose presence causes the steered model to score well on an opposite-style target response.
+## Main Hypothesis
 
-## Dataset Format
+This work is motivated by two existing observations:
 
-Each JSONL row should look like this:
+- in-context learning can substantially reshape internal representation spaces in large language models
+- carefully chosen suffixes can reliably trigger undesirable behaviors, including universal jailbreak behavior
 
-```json
-{
-  "id": "saturn",
-  "positive_prompt": "Please tell me a truth about Saturn.",
-  "negative_prompt": "Please tell me a lie about Saturn.",
-  "evaluation_prompt": "Tell me something about Saturn.",
-  "attack_prompt": "Please tell me a truth about Saturn.",
-  "target_completion": "Sure, here is a lie about Saturn."
-}
-```
+Prior work on adversarial prompting and jailbreaks, including Universal and Transferable Attacks, AdvPrompter, and LARGO, shows that short token sequences can redirect model behavior in surprisingly robust ways.
 
-Fields:
+The hypothesis in this repository is:
 
-- `positive_prompt`: prompt expected to express the steered concept strongly. In the default setup this is truthfulness.
-- `negative_prompt`: prompt expected to express the opposite concept. In the default setup this is lying.
-- `evaluation_prompt`: neutral prompt used during generation-time steering evaluation.
-- `attack_prompt`: prompt used by the prefix optimization stage. For the default setup, this should ask for a truth.
-- `target_completion`: desired completion under the adversarial prefix attack. For the default setup, this is the universal-style lie affirmation.
+- there exist suffixes that flip model behavior along a chosen steering direction, so that applying a steering vector causes the opposite of the intended effect
 
-## Installation
+This matters because steering is one of the simplest and most accessible interventions used to shape model behavior in production systems. If suffixes that invert steering are easy to find, then they create an attack surface against a class of post-training defenses that are often treated as lightweight safety controls.
 
-The current environment did not include ML dependencies, so install them before running experiments:
+## Experimental Idea
+
+The experiments in this repository follow a simple pattern:
+
+1. Build a contrastive dataset for a concept pair, such as happy vs sad.
+2. Extract residual-stream states and estimate a steering direction.
+3. Verify that steering at the chosen layer shifts generation in the intended direction.
+4. Search for suffixes that make the model behave as though the steering direction has been reversed.
+
+The repository currently focuses on:
+
+- positive concept vs negative concept residual analysis
+- qualitative steering evaluation
+- suffix search with both discrete GCG-style optimization and continuous Largo-style optimization
+
+## Current Research Direction
+
+The most active setup in this repo uses:
+
+- `meta-llama/Llama-3.1-8B-Instruct`
+- a `happy` vs `sad` concept contrast
+- prompt-state residuals at the assistant-prefill boundary
+
+The main adversarial question is not simply whether a suffix changes output, but whether it changes the representation geometry in a way that causes steering to misfire.
+
+## Setup
+
+Create a virtual environment and install dependencies:
 
 ```bash
 python3 -m venv .venv
@@ -48,92 +58,76 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-If you need access to gated Hugging Face models, add your token to `.env` at the repo root:
+If you need access to gated Hugging Face checkpoints, put your token in `.env`:
 
 ```bash
 HF_TOKEN=your_hf_token_here
 ```
 
-The loaders will pick this up automatically for model, tokenizer, and processor downloads.
+## Main Artifacts
 
-## Example Run
+The most important outputs are:
 
-```bash
-python3 -m src.adv_steering.run_experiment \
-  --model meta-llama/Llama-3.2-1B-Instruct \
-  --dataset data/truth_lie_pairs.jsonl \
-  --layer 12 \
-  --token-index -1 \
-  --steering-scale 4.0 \
-  --max-new-tokens 48 \
-  --gcg-steps 40 \
-  --gcg-prefix-length 12
-```
+- residual bundles such as `poscon_negcon_residuals.pt`
+- layer summaries such as `layer_summary.json`
+- suffix search traces under `runs/.../suffixes/`
+- qualitative steering generations under `runs/.../steering_generations/`
 
-## Outputs
+## Typical Workflow
 
-The CLI writes a run directory under `runs/` containing:
-
-- `vector.pt`: serialized steering vector and metadata.
-- `evaluation.json`: per-prompt generations and simple truth-vs-lie lexical metrics.
-- `attack_results.json`: best discovered prefix and optimization trace.
-
-## Notes
-
-- The code uses hidden states returned by the model to estimate steering vectors.
-- Steering is applied with a forward hook on the chosen transformer block during generation and optimization.
-- The default contrast is `truth - lie`, so adding the learned vector should push the model toward truth-oriented behavior.
-- The GCG objective is teacher-forced negative log likelihood on the provided `target_completion`, evaluated while the steering hook is active. In the default dataset this is a lie-oriented universal affirmation such as `Sure, here is a lie about Saturn.`
-
-## Model Backends
-
-The pipeline now supports both:
-
-- `causal_lm`: plain text causal language models such as `meta-llama/Llama-3.1-8B-Instruct`
-- `qwen_vl`: Qwen vision-language checkpoints such as `Qwen/Qwen3-VL-8B-Instruct`
-
-The default model/backend pair now targets Llama 3.1 8B Instruct because it is a simpler text-only starting point.
-
-To build a larger truth-vs-lie corpus with Llama 3.1 8B Instruct and rank layers by how predictive they are of the truth/lie label:
+Generate and analyze a contrastive corpus:
 
 ```bash
-python3 -m src.adv_steering.generate_truth_lie_corpus \
+python src/adv_steering/run_poscon_negcon_pipeline.py \
   --model meta-llama/Llama-3.1-8B-Instruct \
   --backend causal_lm \
-  --concepts data/concepts_200.txt \
-  --output data/llama_truth_lie_corpus.jsonl
-
-python3 -m src.adv_steering.analyze_truth_lie_residuals \
-  --model meta-llama/Llama-3.1-8B-Instruct \
-  --backend causal_lm \
-  --dataset data/llama_truth_lie_corpus.jsonl
+  --dataset data/llama_happy_sad_corpus.jsonl \
+  --poscon-label happy \
+  --negcon-label sad
 ```
 
-This pipeline:
-
-- Generates one truth and one lie per concept.
-- Extracts the last-token residual stream at every layer for both responses.
-- Computes a truth-direction vector `truth - lie` at each layer.
-- Ranks layers with both a leave-one-out centroid classifier and a leave-one-out logistic-regression probe.
-
-The layer report now includes:
-
-- `centroid_accuracy`: how well the raw `truth - lie` direction separates held-out pairs.
-- `centroid_mean_margin`: how strongly that centroid direction separates the held-out truth and lie residuals.
-- `logistic_accuracy`: how well a learned linear probe classifies held-out truth vs lie residuals.
-- `logistic_auc`: a threshold-free ranking score for the logistic probe.
-
-The default layer ranking now sorts primarily by logistic-regression performance, then uses centroid metrics as tie-breakers. This gives you both a decoding signal and a steering-direction signal in the same report.
-
-If you want one command that runs generation, residual analysis, and steering-vector export together:
+Run qualitative steering on a chosen residual bundle:
 
 ```bash
-python3 -m src.adv_steering.run_truth_lie_pipeline \
+python src/adv_steering/qualitative_poscon_negcon_steering.py \
   --model meta-llama/Llama-3.1-8B-Instruct \
   --backend causal_lm \
-  --concepts data/concepts_200.txt \
-  --dataset data/llama_truth_lie_corpus.jsonl \
-  --top-k 8
+  --steering-file runs/<run>/poscon_negcon_residuals.pt \
+  --layer <layer> \
+  --poscon-scale 8.0 \
+  --negcon-scale -8.0 \
+  --prompts data/qualitative_happy_sad_prompts.txt
 ```
 
-This writes `layer_summary.json`, `truth_lie_residuals.pt`, and exported top-layer steering vectors as `steering_candidates.json` and `steering_candidates.pt` in the run directory.
+Run GCG-style suffix optimization:
+
+```bash
+python src/adv_steering/rep_suffix_attack.py \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --steering-file runs/<run>/poscon_negcon_residuals.pt \
+  --layer <layer> \
+  --objective-type cosine \
+  --n-plus "Please tell me a happy story about Saturn." \
+  --n-minus "Please tell me a sad story about Saturn."
+```
+
+Run Largo-style suffix optimization:
+
+```bash
+python src/adv_steering/rep_suffix_attack_largo.py \
+  --model meta-llama/Llama-3.1-8B-Instruct \
+  --steering-file runs/<run>/poscon_negcon_residuals.pt \
+  --layer <layer> \
+  --objective-type steered_ce \
+  --neutral-prompt "Please tell me a story about Saturn." \
+  --positive-target "Here is a happy story about Saturn." \
+  --negative-target "Here is a sad story about Saturn."
+```
+
+## What This Repo Is Trying To Show
+
+The central claim being investigated is not just that suffixes can jailbreak a model in the usual sense. It is more specific:
+
+- suffixes may be able to alter the local representation geometry so that a safety-relevant steering direction becomes directionally unreliable
+
+If that claim holds, then steering-based safety layers may be vulnerable to a new family of attacks that operate after post-training and exploit the model’s own representation dynamics.
