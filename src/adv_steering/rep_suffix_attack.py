@@ -12,9 +12,9 @@ import torch.nn.functional as F
 
 if __package__ in (None, ""):
     sys.path.append(str(Path(__file__).resolve().parents[1]))
-    from adv_steering.text_backend import TextModelBundle, encode_chat_prompt, load_text_model_bundle, steering_hook
+    from adv_steering.text_backend import TextModelBundle, encode_chat_prompt, load_text_model_bundle, split_chat_prompt_for_user_suffix, steering_hook
 else:
-    from .text_backend import TextModelBundle, encode_chat_prompt, load_text_model_bundle, steering_hook
+    from .text_backend import TextModelBundle, encode_chat_prompt, load_text_model_bundle, split_chat_prompt_for_user_suffix, steering_hook
 
 
 @dataclass
@@ -44,6 +44,10 @@ class RepSuffixResult:
     objective: float
     baselines: dict
     trace: list[dict]
+    requested_steps: int
+    completed_steps: int
+    early_stopped: bool
+    early_stop_reason: str | None
 
 
 def parse_args():
@@ -112,8 +116,8 @@ def optimize_suffix_against_direction(
 
     prompt_pair_ids = [
         (
-            encode_chat_prompt(bundle, n_plus, add_generation_prompt=True)["input_ids"][0],
-            encode_chat_prompt(bundle, n_minus, add_generation_prompt=True)["input_ids"][0],
+            split_chat_prompt_for_user_suffix(bundle, n_plus),
+            split_chat_prompt_for_user_suffix(bundle, n_minus),
         )
         for n_plus, n_minus in prompt_pairs
     ]
@@ -122,7 +126,7 @@ def optimize_suffix_against_direction(
     if objective_type == "steered_ce":
         if not neutral_prompt or not positive_target or not negative_target:
             raise ValueError("steered_ce requires neutral_prompt, positive_target, and negative_target.")
-        neutral_prompt_ids = encode_chat_prompt(bundle, neutral_prompt, add_generation_prompt=True)["input_ids"][0]
+        neutral_prompt_ids = split_chat_prompt_for_user_suffix(bundle, neutral_prompt)
         target_ids = {
             "positive": torch.tensor(tokenizer.encode(positive_target, add_special_tokens=False), dtype=torch.long, device=device),
             "negative": torch.tensor(tokenizer.encode(negative_target, add_special_tokens=False), dtype=torch.long, device=device),
@@ -189,6 +193,11 @@ def optimize_suffix_against_direction(
     best_objective = float(existing_best_objective) if existing_best_objective is not None else float("inf")
     best_suffix = suffix_token_ids.clone()
     active_examples = 1
+    plateau_suffix_signature: tuple[int, ...] | None = None
+    plateau_tried_edits: set[tuple[int, int]] = set()
+    completed_steps = 0
+    early_stopped = False
+    early_stop_reason: str | None = None
 
     for step_index in range(steps):
         model.zero_grad(set_to_none=True)
@@ -204,9 +213,20 @@ def optimize_suffix_against_direction(
             neutral_prompt_ids=neutral_prompt_ids,
             steering_scale=steering_scale,
         )
+        current_logged_objective = _aggregate_suffix_objective(
+            bundle=bundle,
+            prompt_pair_ids=active_prompt_pair_ids,
+            suffix_token_ids=suffix_token_ids,
+            steering_vector=steering_vector.to(device),
+            layer=layer,
+            objective_type=objective_type,
+            target_ids=target_ids,
+            neutral_prompt_ids=neutral_prompt_ids,
+            steering_scale=steering_scale,
+        )
 
-        if current_objective < best_objective:
-            best_objective = current_objective
+        if current_logged_objective < best_objective:
+            best_objective = current_logged_objective
             best_suffix = suffix_token_ids.clone()
 
         candidate_token_sets = []
@@ -219,16 +239,47 @@ def optimize_suffix_against_direction(
                 filtered_ids = [int(suffix_token_ids[position].item())]
             candidate_token_sets.append(filtered_ids)
 
-        candidate_best_objective = current_objective
+        candidate_best_objective = current_logged_objective
         candidate_best_suffix = suffix_token_ids.clone()
-        candidate_batch = suffix_token_ids.unsqueeze(0).repeat(batch_size, 1)
-        sampled_positions = torch.randint(low=0, high=suffix_length, size=(batch_size,), device=device)
+        current_suffix_signature = tuple(int(token_id) for token_id in suffix_token_ids.tolist())
+        if current_suffix_signature != plateau_suffix_signature:
+            plateau_suffix_signature = current_suffix_signature
+            plateau_tried_edits.clear()
+        candidate_edits: list[tuple[int, int]] = []
+        for position, token_choices in enumerate(candidate_token_sets):
+            current_token_id = int(suffix_token_ids[position].item())
+            unique_choices = []
+            seen_token_ids = set()
+            for token_id in token_choices:
+                token_id = int(token_id)
+                if token_id == current_token_id or token_id in seen_token_ids:
+                    continue
+                seen_token_ids.add(token_id)
+                unique_choices.append(token_id)
+            for token_id in unique_choices:
+                edit = (position, token_id)
+                if edit not in plateau_tried_edits:
+                    candidate_edits.append(edit)
 
-        for batch_index in range(batch_size):
-            position = int(sampled_positions[batch_index].item())
-            token_choices = candidate_token_sets[position]
-            choice_index = int(torch.randint(low=0, high=len(token_choices), size=(1,), device=device).item())
-            candidate_batch[batch_index, position] = token_choices[choice_index]
+        if candidate_edits:
+            if len(candidate_edits) > batch_size:
+                sampled_edit_indices = torch.randperm(len(candidate_edits), device=device)[:batch_size].tolist()
+                sampled_edits = [candidate_edits[index] for index in sampled_edit_indices]
+            else:
+                sampled_edits = candidate_edits
+            candidate_batch = suffix_token_ids.unsqueeze(0).repeat(len(sampled_edits), 1)
+            for batch_index, (position, token_id) in enumerate(sampled_edits):
+                candidate_batch[batch_index, position] = token_id
+        else:
+            completed_steps = step_index
+            early_stopped = True
+            early_stop_reason = "exhausted_local_one_token_neighborhood"
+            print(
+                f"[early stop] requested_steps={steps} completed_steps={completed_steps} "
+                f"reason={early_stop_reason}",
+                flush=True,
+            )
+            break
 
         batch_objectives = _batched_suffix_objectives(
             bundle=bundle,
@@ -242,19 +293,11 @@ def optimize_suffix_against_direction(
             steering_scale=steering_scale,
         )
         best_batch_objective, best_batch_index = torch.min(batch_objectives, dim=0)
-        if float(best_batch_objective.item()) < candidate_best_objective:
-            candidate_best_objective = float(best_batch_objective.item())
-            candidate_best_suffix = candidate_batch[int(best_batch_index.item())].clone()
-
-        suffix_token_ids = candidate_best_suffix
-        if candidate_best_objective < best_objective:
-            best_objective = candidate_best_objective
-            best_suffix = candidate_best_suffix.clone()
-
-        logged_objective = _aggregate_suffix_objective(
+        proposed_suffix = candidate_batch[int(best_batch_index.item())].clone()
+        proposed_logged_objective = _aggregate_suffix_objective(
             bundle=bundle,
             prompt_pair_ids=active_prompt_pair_ids,
-            suffix_token_ids=suffix_token_ids,
+            suffix_token_ids=proposed_suffix,
             steering_vector=steering_vector.to(device),
             layer=layer,
             objective_type=objective_type,
@@ -262,6 +305,22 @@ def optimize_suffix_against_direction(
             neutral_prompt_ids=neutral_prompt_ids,
             steering_scale=steering_scale,
         )
+        if proposed_logged_objective < candidate_best_objective:
+            candidate_best_objective = proposed_logged_objective
+            candidate_best_suffix = proposed_suffix
+
+        suffix_token_ids = candidate_best_suffix
+        logged_objective = candidate_best_objective
+        if logged_objective < best_objective:
+            best_objective = logged_objective
+            best_suffix = candidate_best_suffix.clone()
+        new_suffix_signature = tuple(int(token_id) for token_id in suffix_token_ids.tolist())
+        if sampled_edits and new_suffix_signature == current_suffix_signature:
+            plateau_tried_edits.update(sampled_edits)
+        else:
+            plateau_suffix_signature = new_suffix_signature
+            plateau_tried_edits.clear()
+
         per_prompt_objectives = _per_prompt_objectives(
             bundle=bundle,
             prompt_pair_ids=active_prompt_pair_ids,
@@ -342,6 +401,7 @@ def optimize_suffix_against_direction(
             f"suffix={tokenizer.decode(suffix_token_ids, skip_special_tokens=True)!r}",
             flush=True,
         )
+        completed_steps = step_index + 1
 
     return RepSuffixResult(
         layer=layer,
@@ -351,6 +411,10 @@ def optimize_suffix_against_direction(
         objective=float(best_objective),
         baselines=baselines,
         trace=trace,
+        requested_steps=steps,
+        completed_steps=completed_steps,
+        early_stopped=early_stopped,
+        early_stop_reason=early_stop_reason,
     )
 
 def _aggregate_objective_and_suffix_grad(
@@ -370,12 +434,10 @@ def _aggregate_objective_and_suffix_grad(
     objective = torch.zeros((), device=bundle.device, dtype=torch.float32)
     neutral_prompt_embeds = None
     if neutral_prompt_ids is not None:
-        neutral_prompt_embeds = embedding_layer(neutral_prompt_ids.unsqueeze(0)).detach()
+        neutral_prompt_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, neutral_prompt_ids, prefix_embeds)
     for n_plus_ids, n_minus_ids in prompt_pair_ids:
-        n_plus_embeds = embedding_layer(n_plus_ids.unsqueeze(0)).detach()
-        n_minus_embeds = embedding_layer(n_minus_ids.unsqueeze(0)).detach()
-        plus_prompt_embeds = torch.cat([n_plus_embeds, prefix_embeds], dim=1)
-        minus_prompt_embeds = torch.cat([n_minus_embeds, prefix_embeds], dim=1)
+        plus_prompt_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_plus_ids, prefix_embeds)
+        minus_prompt_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_minus_ids, prefix_embeds)
         prompt_objective, _ = _single_prompt_objective_and_terms(
             bundle=bundle,
             plus_prompt_embeds=plus_prompt_embeds,
@@ -384,7 +446,7 @@ def _aggregate_objective_and_suffix_grad(
             layer=layer,
             objective_type=objective_type,
             target_ids=target_ids,
-            neutral_prompt_embeds=None if neutral_prompt_embeds is None else torch.cat([neutral_prompt_embeds, prefix_embeds], dim=1),
+            neutral_prompt_embeds=neutral_prompt_embeds,
             steering_scale=steering_scale,
         )
         objective = objective + prompt_objective.float()
@@ -410,10 +472,10 @@ def _aggregate_suffix_objective(
     total_objective = 0.0
     neutral_prompt_embeds = None
     if neutral_prompt_ids is not None:
-        neutral_prompt_embeds = torch.cat([embedding_layer(neutral_prompt_ids.unsqueeze(0)), suffix_embeds], dim=1)
+        neutral_prompt_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, neutral_prompt_ids, suffix_embeds)
     for n_plus_ids, n_minus_ids in prompt_pair_ids:
-        plus_embeds = torch.cat([embedding_layer(n_plus_ids.unsqueeze(0)), suffix_embeds], dim=1)
-        minus_embeds = torch.cat([embedding_layer(n_minus_ids.unsqueeze(0)), suffix_embeds], dim=1)
+        plus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_plus_ids, suffix_embeds)
+        minus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_minus_ids, suffix_embeds)
         prompt_objective, _ = _single_prompt_objective_and_terms(
             bundle=bundle,
             plus_prompt_embeds=plus_embeds,
@@ -447,14 +509,11 @@ def _batched_suffix_objectives(
     total_objectives = torch.zeros(batch_size, dtype=torch.float32, device=bundle.device)
     neutral_prompt_embeds = None
     if neutral_prompt_ids is not None:
-        neutral_prefix = embedding_layer(neutral_prompt_ids.unsqueeze(0)).expand(batch_size, -1, -1)
-        neutral_prompt_embeds = torch.cat([neutral_prefix, suffix_embeds], dim=1)
+        neutral_prompt_embeds = _build_batched_prompt_embeds_with_suffix_from_segments(bundle, neutral_prompt_ids, suffix_embeds)
 
     for n_plus_ids, n_minus_ids in prompt_pair_ids:
-        plus_prefix = embedding_layer(n_plus_ids.unsqueeze(0)).expand(batch_size, -1, -1)
-        minus_prefix = embedding_layer(n_minus_ids.unsqueeze(0)).expand(batch_size, -1, -1)
-        plus_embeds = torch.cat([plus_prefix, suffix_embeds], dim=1)
-        minus_embeds = torch.cat([minus_prefix, suffix_embeds], dim=1)
+        plus_embeds = _build_batched_prompt_embeds_with_suffix_from_segments(bundle, n_plus_ids, suffix_embeds)
+        minus_embeds = _build_batched_prompt_embeds_with_suffix_from_segments(bundle, n_minus_ids, suffix_embeds)
         prompt_objective, _ = _batched_prompt_objective_and_terms(
             bundle=bundle,
             plus_prompt_embeds=plus_embeds,
@@ -488,11 +547,11 @@ def _aggregate_objective_breakdown(
     totals = None
     neutral_prompt_embeds = None
     if neutral_prompt_ids is not None:
-        neutral_prompt_embeds = torch.cat([embedding_layer(neutral_prompt_ids.unsqueeze(0)), suffix_embeds], dim=1)
+        neutral_prompt_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, neutral_prompt_ids, suffix_embeds)
 
     for n_plus_ids, n_minus_ids in prompt_pair_ids:
-        plus_embeds = torch.cat([embedding_layer(n_plus_ids.unsqueeze(0)), suffix_embeds], dim=1)
-        minus_embeds = torch.cat([embedding_layer(n_minus_ids.unsqueeze(0)), suffix_embeds], dim=1)
+        plus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_plus_ids, suffix_embeds)
+        minus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_minus_ids, suffix_embeds)
         _, terms = _single_prompt_objective_and_terms(
             bundle=bundle,
             plus_prompt_embeds=plus_embeds,
@@ -532,10 +591,10 @@ def _per_prompt_objectives(
     objectives = []
     neutral_prompt_embeds = None
     if neutral_prompt_ids is not None:
-        neutral_prompt_embeds = torch.cat([embedding_layer(neutral_prompt_ids.unsqueeze(0)), suffix_embeds], dim=1)
+        neutral_prompt_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, neutral_prompt_ids, suffix_embeds)
     for n_plus_ids, n_minus_ids in prompt_pair_ids:
-        plus_embeds = torch.cat([embedding_layer(n_plus_ids.unsqueeze(0)), suffix_embeds], dim=1)
-        minus_embeds = torch.cat([embedding_layer(n_minus_ids.unsqueeze(0)), suffix_embeds], dim=1)
+        plus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_plus_ids, suffix_embeds)
+        minus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_minus_ids, suffix_embeds)
         prompt_objective, _ = _single_prompt_objective_and_terms(
             bundle=bundle,
             plus_prompt_embeds=plus_embeds,
@@ -563,14 +622,14 @@ def _aggregate_cosine_similarity(
     suffix_embeds = embedding_layer(suffix_token_ids.unsqueeze(0))
     aggregate_difference = None
     for n_plus_ids, n_minus_ids in prompt_pair_ids:
-        plus_embeds = torch.cat([embedding_layer(n_plus_ids.unsqueeze(0)), suffix_embeds], dim=1)
-        minus_embeds = torch.cat([embedding_layer(n_minus_ids.unsqueeze(0)), suffix_embeds], dim=1)
+        plus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_plus_ids, suffix_embeds)
+        minus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_minus_ids, suffix_embeds)
         plus_state = _last_token_hidden_from_embeds(bundle=bundle, prompt_embeds=plus_embeds, layer=layer)
         minus_state = _last_token_hidden_from_embeds(bundle=bundle, prompt_embeds=minus_embeds, layer=layer)
-        difference = plus_state - minus_state
+        difference = (plus_state - minus_state).float()
         aggregate_difference = difference if aggregate_difference is None else aggregate_difference + difference
 
-    typed_steering_vector = steering_vector.to(aggregate_difference.dtype)
+    typed_steering_vector = steering_vector.to(device=aggregate_difference.device, dtype=torch.float32)
     numerator = torch.dot(typed_steering_vector, aggregate_difference)
     denominator = typed_steering_vector.norm().clamp_min(1e-8) * aggregate_difference.norm().clamp_min(1e-8)
     return float((numerator / denominator).item())
@@ -588,8 +647,8 @@ def _aggregate_dot_product(
     suffix_embeds = embedding_layer(suffix_token_ids.unsqueeze(0))
     aggregate_difference = None
     for n_plus_ids, n_minus_ids in prompt_pair_ids:
-        plus_embeds = torch.cat([embedding_layer(n_plus_ids.unsqueeze(0)), suffix_embeds], dim=1)
-        minus_embeds = torch.cat([embedding_layer(n_minus_ids.unsqueeze(0)), suffix_embeds], dim=1)
+        plus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_plus_ids, suffix_embeds)
+        minus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_minus_ids, suffix_embeds)
         plus_state = _last_token_hidden_from_embeds(bundle=bundle, prompt_embeds=plus_embeds, layer=layer)
         minus_state = _last_token_hidden_from_embeds(bundle=bundle, prompt_embeds=minus_embeds, layer=layer)
         difference = plus_state - minus_state
@@ -618,13 +677,20 @@ def _average_next_token_kl(
 @torch.no_grad()
 def _prompt_next_token_kl(
     bundle: TextModelBundle,
-    prompt_ids: torch.Tensor,
+    prompt_ids: dict[str, torch.Tensor],
     suffix_token_ids: torch.Tensor,
 ) -> float:
     embedding_layer = bundle.model.get_input_embeddings()
 
-    base_embeds = embedding_layer(prompt_ids.unsqueeze(0))
-    suffixed_embeds = torch.cat([base_embeds, embedding_layer(suffix_token_ids.unsqueeze(0))], dim=1)
+    base_input_ids, _ = _build_input_ids_with_user_suffix_from_segments(
+        bundle,
+        prompt_ids,
+        torch.empty((0,), dtype=suffix_token_ids.dtype, device=bundle.device),
+    )
+    suffixed_input_ids, _ = _build_input_ids_with_user_suffix_from_segments(bundle, prompt_ids, suffix_token_ids)
+
+    base_embeds = embedding_layer(base_input_ids)
+    suffixed_embeds = embedding_layer(suffixed_input_ids)
 
     base_logits = _next_token_logits_from_embeds(bundle, base_embeds)
     suffixed_logits = _next_token_logits_from_embeds(bundle, suffixed_embeds)
@@ -701,6 +767,51 @@ def _compute_suffix_metrics(
     }
 
 
+def _build_prompt_embeds_with_suffix_from_segments(
+    bundle: TextModelBundle,
+    prompt_segments: dict[str, torch.Tensor],
+    suffix_embeds: torch.Tensor,
+) -> torch.Tensor:
+    embedding_layer = bundle.model.get_input_embeddings()
+    user_embeds = embedding_layer(prompt_segments["user_input_ids"]).detach()
+    assistant_prefix_embeds = embedding_layer(prompt_segments["assistant_prefix_ids"]).detach()
+    return torch.cat([user_embeds, suffix_embeds, assistant_prefix_embeds], dim=1)
+
+
+def _build_batched_prompt_embeds_with_suffix_from_segments(
+    bundle: TextModelBundle,
+    prompt_segments: dict[str, torch.Tensor],
+    suffix_embeds: torch.Tensor,
+) -> torch.Tensor:
+    embedding_layer = bundle.model.get_input_embeddings()
+    batch_size = suffix_embeds.shape[0]
+    user_embeds = embedding_layer(prompt_segments["user_input_ids"]).expand(batch_size, -1, -1)
+    assistant_prefix_embeds = embedding_layer(prompt_segments["assistant_prefix_ids"]).expand(batch_size, -1, -1)
+    return torch.cat([user_embeds, suffix_embeds, assistant_prefix_embeds], dim=1)
+
+
+def _build_input_ids_with_user_suffix_from_segments(
+    bundle: TextModelBundle,
+    prompt_segments: dict[str, torch.Tensor],
+    suffix_token_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    user_input_ids = prompt_segments["user_input_ids"]
+    user_attention_mask = prompt_segments["user_attention_mask"]
+    assistant_prefix_ids = prompt_segments["assistant_prefix_ids"]
+    assistant_prefix_attention_mask = prompt_segments["assistant_prefix_attention_mask"]
+    suffix_tensor = suffix_token_ids.to(bundle.device, dtype=user_input_ids.dtype).unsqueeze(0)
+    input_ids = torch.cat([user_input_ids, suffix_tensor, assistant_prefix_ids], dim=1)
+    attention_mask = torch.cat(
+        [
+            user_attention_mask,
+            torch.ones((1, suffix_tensor.shape[1]), dtype=user_attention_mask.dtype, device=bundle.device),
+            assistant_prefix_attention_mask,
+        ],
+        dim=1,
+    )
+    return input_ids, attention_mask
+
+
 def _print_baselines(objective_type: str, baselines: dict) -> None:
     no_suffix = baselines["no_suffix"]
     fill_suffix = baselines["fill_suffix"]
@@ -735,10 +846,12 @@ def _pair_objective(
     objective_type: str,
 ) -> torch.Tensor:
     difference = plus_state - minus_state
-    typed_steering_vector = steering_vector.to(difference.dtype)
     if objective_type == "dot":
+        typed_steering_vector = steering_vector.to(difference.dtype)
         return torch.dot(typed_steering_vector, difference)
     if objective_type == "cosine":
+        difference = difference.float()
+        typed_steering_vector = steering_vector.to(device=difference.device, dtype=torch.float32)
         numerator = torch.dot(typed_steering_vector, difference)
         denominator = typed_steering_vector.norm().clamp_min(1e-8) * difference.norm().clamp_min(1e-8)
         return numerator / denominator
@@ -752,10 +865,12 @@ def _batched_pair_objective(
     objective_type: str,
 ) -> torch.Tensor:
     difference = plus_states - minus_states
-    typed_steering_vector = steering_vector.to(difference.dtype)
     if objective_type == "dot":
+        typed_steering_vector = steering_vector.to(difference.dtype)
         return torch.matmul(difference, typed_steering_vector)
     if objective_type == "cosine":
+        difference = difference.float()
+        typed_steering_vector = steering_vector.to(device=difference.device, dtype=torch.float32)
         numerator = torch.matmul(difference, typed_steering_vector)
         denominator = typed_steering_vector.norm().clamp_min(1e-8) * difference.norm(dim=-1).clamp_min(1e-8)
         return numerator / denominator
@@ -789,6 +904,7 @@ def _single_prompt_objective_and_terms(
     plus_state = _last_token_hidden_from_embeds(bundle=bundle, prompt_embeds=plus_prompt_embeds, layer=layer)
     minus_state = _last_token_hidden_from_embeds(bundle=bundle, prompt_embeds=minus_prompt_embeds, layer=layer)
     typed_steering_vector = steering_vector.to(plus_state.dtype)
+    typed_steering_vector_f32 = steering_vector.to(device=plus_state.device, dtype=torch.float32)
     objective = _pair_objective(
         steering_vector=typed_steering_vector,
         plus_state=plus_state,
@@ -796,9 +912,9 @@ def _single_prompt_objective_and_terms(
         objective_type=objective_type,
     )
     return objective, {
-        "plus_projection": torch.dot(typed_steering_vector, plus_state),
-        "minus_projection_negated": -torch.dot(typed_steering_vector, minus_state),
-        "unused_term": torch.zeros((), device=plus_state.device, dtype=plus_state.dtype),
+        "plus_projection": torch.dot(typed_steering_vector_f32, plus_state.float()),
+        "minus_projection_negated": -torch.dot(typed_steering_vector_f32, minus_state.float()),
+        "unused_term": torch.zeros((), device=plus_state.device, dtype=torch.float32),
     }
 
 
@@ -829,6 +945,7 @@ def _batched_prompt_objective_and_terms(
     plus_states = _last_token_hidden_from_embeds_batched(bundle=bundle, prompt_embeds=plus_prompt_embeds, layer=layer)
     minus_states = _last_token_hidden_from_embeds_batched(bundle=bundle, prompt_embeds=minus_prompt_embeds, layer=layer)
     typed_steering_vector = steering_vector.to(plus_states.dtype)
+    typed_steering_vector_f32 = steering_vector.to(device=plus_states.device, dtype=torch.float32)
     objective = _batched_pair_objective(
         steering_vector=typed_steering_vector,
         plus_states=plus_states,
@@ -836,9 +953,9 @@ def _batched_prompt_objective_and_terms(
         objective_type=objective_type,
     )
     return objective, {
-        "plus_projection": torch.matmul(plus_states, typed_steering_vector),
-        "minus_projection_negated": -torch.matmul(minus_states, typed_steering_vector),
-        "unused_term": torch.zeros_like(objective),
+        "plus_projection": torch.matmul(plus_states.float(), typed_steering_vector_f32),
+        "minus_projection_negated": -torch.matmul(minus_states.float(), typed_steering_vector_f32),
+        "unused_term": torch.zeros_like(objective, dtype=torch.float32),
     }
 
 
@@ -1099,6 +1216,10 @@ def main():
         "objective": result.objective,
         "baselines": result.baselines,
         "trace": result.trace,
+        "requested_steps": result.requested_steps,
+        "completed_steps": result.completed_steps,
+        "early_stopped": result.early_stopped,
+        "early_stop_reason": result.early_stop_reason,
         "prompt_pairs": [{"n_plus": n_plus, "n_minus": n_minus} for n_plus, n_minus in prompt_pairs],
         "resume_from": args.resume_from,
     }

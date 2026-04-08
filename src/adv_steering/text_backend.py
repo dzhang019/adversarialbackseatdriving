@@ -195,7 +195,7 @@ def encode_chat_prompt(
     add_generation_prompt: bool = True,
 ) -> dict[str, torch.Tensor]:
     messages = [{"role": "user", "content": prompt}]
-    if hasattr(bundle.tokenizer, "apply_chat_template"):
+    if hasattr(bundle.tokenizer, "apply_chat_template") and getattr(bundle.tokenizer, "chat_template", None):
         encoded = bundle.tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=add_generation_prompt,
@@ -204,8 +204,43 @@ def encode_chat_prompt(
         )
         return {key: value.to(bundle.device) for key, value in encoded.items()}
 
-    encoded = bundle.tokenizer(prompt, return_tensors="pt")
+    fallback_prompt = _fallback_chat_prompt_text(bundle.tokenizer, prompt, add_generation_prompt)
+    encoded = bundle.tokenizer(fallback_prompt, return_tensors="pt")
     return {key: value.to(bundle.device) for key, value in encoded.items()}
+
+
+def split_chat_prompt_for_user_suffix(
+    bundle: TextModelBundle,
+    prompt: str,
+) -> dict[str, torch.Tensor]:
+    prompt_without_generation = encode_chat_prompt(bundle, prompt, add_generation_prompt=False)
+    prompt_with_generation = encode_chat_prompt(bundle, prompt, add_generation_prompt=True)
+
+    prefix_ids = prompt_without_generation["input_ids"]
+    full_ids = prompt_with_generation["input_ids"]
+    prefix_attention_mask = prompt_without_generation["attention_mask"]
+    full_attention_mask = prompt_with_generation["attention_mask"]
+
+    prefix_length = prefix_ids.shape[1]
+    if full_ids.shape[1] < prefix_length or not torch.equal(full_ids[:, :prefix_length], prefix_ids):
+        raise ValueError(
+            "Could not split the chat template into user-prefix and assistant-generation suffix. "
+            "This tokenizer's generation prompt is not a simple token suffix."
+        )
+
+    return {
+        "user_input_ids": prefix_ids,
+        "user_attention_mask": prefix_attention_mask,
+        "assistant_prefix_ids": full_ids[:, prefix_length:],
+        "assistant_prefix_attention_mask": full_attention_mask[:, prefix_length:],
+    }
+
+
+def _fallback_chat_prompt_text(tokenizer, prompt: str, add_generation_prompt: bool) -> str:
+    name = (getattr(tokenizer, "name_or_path", "") or "").lower()
+    if "llama-2" in name and "chat" in name:
+        return f"[INST] {prompt.strip()} [/INST]"
+    return prompt
 
 
 def load_concepts(path: str | Path) -> list[str]:

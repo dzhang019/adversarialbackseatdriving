@@ -17,7 +17,7 @@ if __package__ in (None, ""):
         load_prompt_pairs,
         load_steering_vector,
     )
-    from adv_steering.text_backend import encode_chat_prompt, load_text_model_bundle, steering_hook
+    from adv_steering.text_backend import encode_chat_prompt, load_text_model_bundle, split_chat_prompt_for_user_suffix, steering_hook
 else:
     from .rep_suffix_attack import (
         _default_fill_token_id,
@@ -25,7 +25,7 @@ else:
         load_prompt_pairs,
         load_steering_vector,
     )
-    from .text_backend import encode_chat_prompt, load_text_model_bundle, steering_hook
+    from .text_backend import encode_chat_prompt, load_text_model_bundle, split_chat_prompt_for_user_suffix, steering_hook
 
 
 def parse_args():
@@ -46,14 +46,13 @@ def parse_args():
     parser.add_argument("--positive-target", default="")
     parser.add_argument("--negative-target", default="")
     parser.add_argument("--steering-scale", type=float, default=8.0)
-    parser.add_argument("--suffix-length", type=int, default=20)
+    parser.add_argument("--suffix-length", type=int, default=200)
     parser.add_argument("--outer-steps", type=int, default=15, help="How many summarize-and-reinterpret rounds to run.")
-    parser.add_argument("--inner-steps", type=int, default=10, help="How many gradient steps to take on the suffix matrix per outer round.")
+    parser.add_argument("--inner-steps", type=int, default=20, help="How many gradient steps to take on the suffix matrix per outer round.")
     parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-3)
-    parser.add_argument("--init-mode", default="random_tokens", choices=["zeros", "random_tokens"])
-    parser.add_argument("--summary-prompt", default="Summarize the following for me:")
-    parser.add_argument("--summary-max-new-tokens", type=int, default=64)
+    parser.add_argument("--weight-decay", type=float, default=1e-2)
+    parser.add_argument("--init-mode", default="zeros", choices=["zeros", "random_tokens"])
+    parser.add_argument("--summary-prompt", default="Summarize the following: ")
     parser.add_argument("--success-threshold", type=float, default=0.0, help="Only used for dot/cosine style objective success checks on the training set.")
     parser.add_argument("--eval-prompts-file", default="", help="Optional held-out prompts, one per line.")
     parser.add_argument("--eval-max-prompts", type=int, default=0, help="Optional cap on held-out prompts.")
@@ -78,10 +77,10 @@ def main():
         positive_prompt=args.positive_prompt,
         negative_prompt=args.negative_prompt,
     )
-    prompt_pair_ids = [
+    prompt_pair_segments = [
         (
-            encode_chat_prompt(bundle, n_plus, add_generation_prompt=True)["input_ids"][0],
-            encode_chat_prompt(bundle, n_minus, add_generation_prompt=True)["input_ids"][0],
+            split_chat_prompt_for_user_suffix(bundle, n_plus),
+            split_chat_prompt_for_user_suffix(bundle, n_minus),
         )
         for n_plus, n_minus in prompt_pairs
     ]
@@ -91,6 +90,11 @@ def main():
         neutral_prompt=args.neutral_prompt,
         positive_target=args.positive_target,
         negative_target=args.negative_target,
+    )
+    neutral_prompt_segments = (
+        split_chat_prompt_for_user_suffix(bundle, args.neutral_prompt)
+        if args.objective_type == "steered_ce"
+        else None
     )
     eval_prompts = load_eval_prompts(args.eval_prompts_file, args.eval_max_prompts)
     hapsad_wordbank = load_hapsad_wordbank(args.hapsad_wordbank_file)
@@ -124,43 +128,48 @@ def main():
     }
 
     for outer_step in range(args.outer_steps):
-        suffix_embeds = optimize_suffix_matrix(
+        suffix_embeds, inner_step_losses = optimize_suffix_matrix(
             bundle=bundle,
             suffix_embeds=suffix_embeds,
-            prompt_pair_ids=prompt_pair_ids,
+            prompt_pair_segments=prompt_pair_segments,
             steering_vector=steering_vector,
             layer=args.layer,
             objective_type=args.objective_type,
             target_ids=target_ids,
-            neutral_prompt_ids=neutral_prompt_ids,
+            neutral_prompt_segments=neutral_prompt_segments,
             steering_scale=args.steering_scale,
             inner_steps=args.inner_steps,
             learning_rate=args.learning_rate,
             weight_decay=args.weight_decay,
         )
 
-        summary_text = summarize_suffix_matrix(
+        summary_token_ids, summary_text = summarize_suffix_matrix(
             bundle=bundle,
             suffix_embeds=suffix_embeds,
+            model_name=args.model,
             summary_prompt=args.summary_prompt,
-            max_new_tokens=args.summary_max_new_tokens,
+            max_new_tokens=args.suffix_length,
         )
-        suffix_token_ids = normalize_summary_to_suffix_ids(
+        suffix_token_ids = truncate_suffix_token_ids(
             bundle=bundle,
-            summary_text=summary_text,
+            summary_token_ids=summary_token_ids,
             suffix_length=args.suffix_length,
         )
-        suffix_embeds = embedding_layer(suffix_token_ids.unsqueeze(0)).detach()
+        suffix_embeds = suffix_embeds_from_summary_token_ids(
+            bundle=bundle,
+            summary_token_ids=suffix_token_ids,
+            suffix_length=args.suffix_length,
+        )
 
         objective, breakdown, dot_product, cosine_similarity = evaluate_suffix_from_token_ids(
             bundle=bundle,
-            prompt_pair_ids=prompt_pair_ids,
+            prompt_pair_segments=prompt_pair_segments,
             suffix_token_ids=suffix_token_ids,
             steering_vector=steering_vector,
             layer=args.layer,
             objective_type=args.objective_type,
             target_ids=target_ids,
-            neutral_prompt_ids=neutral_prompt_ids,
+            neutral_prompt_segments=neutral_prompt_segments,
             steering_scale=args.steering_scale,
         )
         eval_result = evaluate_held_out_behavior(
@@ -183,6 +192,8 @@ def main():
                 "objective_breakdown": breakdown,
                 "dot_product": dot_product,
                 "cosine_similarity": cosine_similarity,
+                "inner_step_losses": inner_step_losses,
+                "summary_token_ids": suffix_token_ids.tolist(),
                 "summary_text": summary_text,
                 "suffix_token_ids": suffix_token_ids.tolist(),
                 "suffix_text": suffix_text,
@@ -261,10 +272,10 @@ def initialize_suffix_embeds(bundle, suffix_length: int, init_mode: str) -> torc
     embedding_layer = bundle.model.get_input_embeddings()
     hidden_size = embedding_layer.weight.shape[1]
     if init_mode == "zeros":
-        return torch.zeros((1, suffix_length, hidden_size), device=bundle.device, dtype=embedding_layer.weight.dtype)
+        return torch.zeros((1, suffix_length, hidden_size), device=bundle.device, dtype=torch.float32)
     vocab_size = embedding_layer.weight.shape[0]
     token_ids = torch.randint(low=0, high=vocab_size, size=(suffix_length,), device=bundle.device)
-    return embedding_layer(token_ids.unsqueeze(0)).detach()
+    return embedding_layer(token_ids.unsqueeze(0)).detach().float()
 
 
 @torch.no_grad()
@@ -278,32 +289,31 @@ def nearest_token_ids_for_suffix_embeds(bundle, suffix_embeds: torch.Tensor) -> 
 def optimize_suffix_matrix(
     bundle,
     suffix_embeds: torch.Tensor,
-    prompt_pair_ids,
+    prompt_pair_segments,
     steering_vector: torch.Tensor,
     layer: int,
     objective_type: str,
     target_ids,
-    neutral_prompt_ids,
+    neutral_prompt_segments,
     steering_scale: float,
     inner_steps: int,
     learning_rate: float,
     weight_decay: float,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, list[float]]:
     embedding_layer = bundle.model.get_input_embeddings()
-    suffix_parameter = torch.nn.Parameter(suffix_embeds.detach().clone())
+    suffix_parameter = torch.nn.Parameter(suffix_embeds.detach().clone().float())
     optimizer = torch.optim.Adam([suffix_parameter], lr=learning_rate, weight_decay=weight_decay)
-    neutral_prompt_embeds = None
-    if neutral_prompt_ids is not None:
-        neutral_prompt_embeds = embedding_layer(neutral_prompt_ids.unsqueeze(0)).detach()
+    objective_prompt_pair_segments = prompt_pair_segments if objective_type != "steered_ce" else prompt_pair_segments[:1]
+    inner_step_losses: list[float] = []
 
-    objective_prompt_pair_ids = prompt_pair_ids if objective_type != "steered_ce" else prompt_pair_ids[:1]
-
-    for _ in range(inner_steps):
+    for inner_step in range(inner_steps):
         optimizer.zero_grad(set_to_none=True)
         objective = torch.zeros((), device=bundle.device, dtype=torch.float32)
-        for n_plus_ids, n_minus_ids in objective_prompt_pair_ids:
-            plus_prompt_embeds = torch.cat([embedding_layer(n_plus_ids.unsqueeze(0)).detach(), suffix_parameter], dim=1)
-            minus_prompt_embeds = torch.cat([embedding_layer(n_minus_ids.unsqueeze(0)).detach(), suffix_parameter], dim=1)
+        suffix_prompt_embeds = suffix_parameter.to(embedding_layer.weight.dtype)
+        neutral_prompt_embeds = None if neutral_prompt_segments is None else build_prompt_embeds_with_suffix(bundle, neutral_prompt_segments, suffix_prompt_embeds)
+        for plus_segments, minus_segments in objective_prompt_pair_segments:
+            plus_prompt_embeds = build_prompt_embeds_with_suffix(bundle, plus_segments, suffix_prompt_embeds)
+            minus_prompt_embeds = build_prompt_embeds_with_suffix(bundle, minus_segments, suffix_prompt_embeds)
             prompt_objective, _ = _single_prompt_objective_and_terms(
                 bundle=bundle,
                 plus_prompt_embeds=plus_prompt_embeds,
@@ -312,22 +322,42 @@ def optimize_suffix_matrix(
                 layer=layer,
                 objective_type=objective_type,
                 target_ids=target_ids,
-                neutral_prompt_embeds=None if neutral_prompt_embeds is None else torch.cat([neutral_prompt_embeds, suffix_parameter], dim=1),
+                neutral_prompt_embeds=neutral_prompt_embeds,
                 steering_scale=steering_scale,
             )
             objective = objective + prompt_objective.float()
         objective.backward()
+        torch.nn.utils.clip_grad_norm_([suffix_parameter], max_norm=1.0)
         optimizer.step()
+        if not torch.isfinite(suffix_parameter).all():
+            raise ValueError(f"Non-finite suffix parameter after inner step {inner_step + 1}/{inner_steps}.")
+        objective_value = float(objective.detach().item())
+        inner_step_losses.append(objective_value)
+        print(
+            f"  [inner {inner_step + 1}/{inner_steps}] objective={objective_value:.6f}",
+            flush=True,
+        )
 
-    return suffix_parameter.detach()
+    return suffix_parameter.detach(), inner_step_losses
 
 
 @torch.no_grad()
-def summarize_suffix_matrix(bundle, suffix_embeds: torch.Tensor, summary_prompt: str, max_new_tokens: int) -> str:
-    prompt_ids = encode_chat_prompt(bundle, summary_prompt, add_generation_prompt=True)["input_ids"][0]
+def summarize_suffix_matrix(
+    bundle,
+    suffix_embeds: torch.Tensor,
+    model_name: str,
+    summary_prompt: str,
+    max_new_tokens: int,
+) -> tuple[list[int], str]:
     embedding_layer = bundle.model.get_input_embeddings()
-    prompt_embeds = embedding_layer(prompt_ids.unsqueeze(0))
-    full_embeds = torch.cat([prompt_embeds, suffix_embeds], dim=1)
+    if not torch.isfinite(suffix_embeds).all():
+        raise ValueError("Cannot summarize suffix matrix because it contains non-finite values.")
+    prefix_embeds, suffix_wrapper_embeds = build_interpretation_wrapper_embeds(
+        bundle=bundle,
+        model_name=model_name,
+        summary_prompt=summary_prompt,
+    )
+    full_embeds = torch.cat([prefix_embeds, suffix_embeds.to(prefix_embeds.dtype), suffix_wrapper_embeds], dim=1)
     attention_mask = torch.ones(full_embeds.shape[:2], dtype=torch.long, device=bundle.device)
     generated_token_ids = []
     current_embeds = full_embeds
@@ -339,7 +369,8 @@ def summarize_suffix_matrix(bundle, suffix_embeds: torch.Tensor, summary_prompt:
             attention_mask=current_attention,
             use_cache=False,
         )
-        next_token_id = int(torch.argmax(outputs.logits[0, -1]).item())
+        next_token_logits = outputs.logits[0, -1] / 1.0
+        next_token_id = int(torch.multinomial(torch.softmax(next_token_logits.float(), dim=-1), num_samples=1).item())
         if next_token_id == bundle.tokenizer.eos_token_id:
             break
         generated_token_ids.append(next_token_id)
@@ -349,52 +380,71 @@ def summarize_suffix_matrix(bundle, suffix_embeds: torch.Tensor, summary_prompt:
             [current_attention, torch.ones((1, 1), dtype=current_attention.dtype, device=bundle.device)],
             dim=1,
         )
-    return bundle.tokenizer.decode(generated_token_ids, skip_special_tokens=True).strip()
+    return generated_token_ids, bundle.tokenizer.decode(generated_token_ids, skip_special_tokens=True).strip()
 
 
-def normalize_summary_to_suffix_ids(bundle, summary_text: str, suffix_length: int) -> torch.Tensor:
-    tokenizer = bundle.tokenizer
-    token_ids = tokenizer.encode(summary_text, add_special_tokens=False)
-    fill_token_id = space_or_fill_token_id(tokenizer)
-    if len(token_ids) < suffix_length:
-        token_ids = token_ids + [fill_token_id] * (suffix_length - len(token_ids))
-    else:
-        token_ids = token_ids[:suffix_length]
+def build_interpretation_wrapper_embeds(bundle, model_name: str, summary_prompt: str) -> tuple[torch.Tensor, torch.Tensor]:
+    embedding_layer = bundle.model.get_input_embeddings()
+    model_name_lower = model_name.lower()
+    if "llama-2" in model_name_lower:
+        prefix_text = f"[INST] {summary_prompt}"
+        suffix_text = " [/INST] Sure, I will summarize the message:"
+        prefix_ids = bundle.tokenizer.encode(prefix_text, add_special_tokens=True, return_tensors="pt").to(bundle.device)
+        suffix_ids = bundle.tokenizer.encode(suffix_text, add_special_tokens=False, return_tensors="pt").to(bundle.device)
+        return embedding_layer(prefix_ids), embedding_layer(suffix_ids)
+
+    user_prompt = f"{summary_prompt}"
+    prefix_ids = encode_chat_prompt(bundle, user_prompt, add_generation_prompt=True)["input_ids"][0]
+    assistant_prefill_ids = bundle.tokenizer.encode("Sure, I will summarize the message:", add_special_tokens=False, return_tensors="pt").to(bundle.device)
+    prefix_embeds = embedding_layer(prefix_ids.unsqueeze(0))
+    assistant_prefill_embeds = embedding_layer(assistant_prefill_ids)
+    return prefix_embeds, assistant_prefill_embeds
+
+
+def truncate_suffix_token_ids(bundle, summary_token_ids: list[int], suffix_length: int) -> torch.Tensor:
+    token_ids = summary_token_ids[:suffix_length]
     return torch.tensor(token_ids, dtype=torch.long, device=bundle.device)
 
 
-def space_or_fill_token_id(tokenizer) -> int:
-    token_ids = tokenizer.encode(" ", add_special_tokens=False)
-    if len(token_ids) == 1:
-        return token_ids[0]
-    return _default_fill_token_id(tokenizer)
+def suffix_embeds_from_summary_token_ids(bundle, summary_token_ids: torch.Tensor, suffix_length: int) -> torch.Tensor:
+    embedding_layer = bundle.model.get_input_embeddings()
+    if summary_token_ids.numel() == 0:
+        hidden_size = embedding_layer.weight.shape[1]
+        return torch.zeros((1, suffix_length, hidden_size), device=bundle.device, dtype=torch.float32)
+
+    summary_embeds = embedding_layer(summary_token_ids.unsqueeze(0)).detach().float()
+    if summary_embeds.shape[1] < suffix_length:
+        pad_size = suffix_length - summary_embeds.shape[1]
+        padding = torch.zeros((1, pad_size, summary_embeds.shape[2]), device=bundle.device, dtype=summary_embeds.dtype)
+        summary_embeds = torch.cat([summary_embeds, padding], dim=1)
+    else:
+        summary_embeds = summary_embeds[:, :suffix_length, :]
+    return summary_embeds
 
 
 @torch.no_grad()
 def evaluate_suffix_from_token_ids(
     bundle,
-    prompt_pair_ids,
+    prompt_pair_segments,
     suffix_token_ids: torch.Tensor,
     steering_vector: torch.Tensor,
     layer: int,
     objective_type: str,
     target_ids,
-    neutral_prompt_ids,
+    neutral_prompt_segments,
     steering_scale: float,
 ):
     embedding_layer = bundle.model.get_input_embeddings()
     suffix_embeds = embedding_layer(suffix_token_ids.unsqueeze(0))
-    neutral_prompt_embeds = None
-    if neutral_prompt_ids is not None:
-        neutral_prompt_embeds = torch.cat([embedding_layer(neutral_prompt_ids.unsqueeze(0)), suffix_embeds], dim=1)
+    neutral_prompt_embeds = None if neutral_prompt_segments is None else build_prompt_embeds_with_suffix(bundle, neutral_prompt_segments, suffix_embeds)
 
-    objective_prompt_pair_ids = prompt_pair_ids if objective_type != "steered_ce" else prompt_pair_ids[:1]
+    objective_prompt_pair_segments = prompt_pair_segments if objective_type != "steered_ce" else prompt_pair_segments[:1]
 
     objective = 0.0
     breakdown = None
-    for n_plus_ids, n_minus_ids in objective_prompt_pair_ids:
-        plus_prompt_embeds = torch.cat([embedding_layer(n_plus_ids.unsqueeze(0)), suffix_embeds], dim=1)
-        minus_prompt_embeds = torch.cat([embedding_layer(n_minus_ids.unsqueeze(0)), suffix_embeds], dim=1)
+    for plus_segments, minus_segments in objective_prompt_pair_segments:
+        plus_prompt_embeds = build_prompt_embeds_with_suffix(bundle, plus_segments, suffix_embeds)
+        minus_prompt_embeds = build_prompt_embeds_with_suffix(bundle, minus_segments, suffix_embeds)
         prompt_objective, terms = _single_prompt_objective_and_terms(
             bundle=bundle,
             plus_prompt_embeds=plus_prompt_embeds,
@@ -414,9 +464,9 @@ def evaluate_suffix_from_token_ids(
                 breakdown[name] += float(value.item())
 
     aggregate_difference = None
-    for n_plus_ids, n_minus_ids in prompt_pair_ids:
-        plus_prompt_embeds = torch.cat([embedding_layer(n_plus_ids.unsqueeze(0)), suffix_embeds], dim=1)
-        minus_prompt_embeds = torch.cat([embedding_layer(n_minus_ids.unsqueeze(0)), suffix_embeds], dim=1)
+    for plus_segments, minus_segments in prompt_pair_segments:
+        plus_prompt_embeds = build_prompt_embeds_with_suffix(bundle, plus_segments, suffix_embeds)
+        minus_prompt_embeds = build_prompt_embeds_with_suffix(bundle, minus_segments, suffix_embeds)
         plus_state = last_token_hidden_from_embeds(bundle, plus_prompt_embeds, layer)
         minus_state = last_token_hidden_from_embeds(bundle, minus_prompt_embeds, layer)
         difference = plus_state - minus_state
@@ -431,6 +481,13 @@ def evaluate_suffix_from_token_ids(
         ).item()
     )
     return objective, breakdown or {}, dot_product, cosine_similarity
+
+
+def build_prompt_embeds_with_suffix(bundle, prompt_segments: dict[str, torch.Tensor], suffix_embeds: torch.Tensor) -> torch.Tensor:
+    embedding_layer = bundle.model.get_input_embeddings()
+    user_embeds = embedding_layer(prompt_segments["user_input_ids"]).detach()
+    assistant_prefix_embeds = embedding_layer(prompt_segments["assistant_prefix_ids"]).detach()
+    return torch.cat([user_embeds, suffix_embeds, assistant_prefix_embeds], dim=1)
 
 
 @torch.no_grad()

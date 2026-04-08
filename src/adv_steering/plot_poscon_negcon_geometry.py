@@ -49,6 +49,7 @@ def main():
     poscon_2d = points_2d[: len(rows)]
     negcon_2d = points_2d[len(rows) :]
 
+    pc_alignment = compute_pc_alignment(average_direction, pca.components_)
     average_direction_2d = pca.components_ @ average_direction
 
     output_dir = Path(args.output_dir) if args.output_dir else Path(args.residual_file).resolve().parent
@@ -56,10 +57,23 @@ def main():
 
     similarities_path = output_dir / f"layer_{layer}_pair_cosine_to_average.json"
     plot_path = output_dir / f"layer_{layer}_pair_pca.png"
+    alignment_path = output_dir / f"layer_{layer}_steering_pc_alignment.json"
     similarities_path.write_text(json.dumps(similarity_rows, indent=2), encoding="utf-8")
+    alignment_path.write_text(json.dumps(pc_alignment, indent=2), encoding="utf-8")
     save_plot(rows, poscon_2d, negcon_2d, average_direction_2d, plot_path, layer)
 
-    print(json.dumps({"layer": layer, "similarities_path": str(similarities_path), "plot_path": str(plot_path)}, indent=2))
+    print(
+        json.dumps(
+            {
+                "layer": layer,
+                "pc_alignment": pc_alignment,
+                "similarities_path": str(similarities_path),
+                "alignment_path": str(alignment_path),
+                "plot_path": str(plot_path),
+            },
+            indent=2,
+        )
+    )
 
 
 def build_similarity_rows(rows: list[dict], diff_layer: np.ndarray, average_direction: np.ndarray) -> list[dict]:
@@ -79,6 +93,20 @@ def build_similarity_rows(rows: list[dict], diff_layer: np.ndarray, average_dire
         )
     result.sort(key=lambda item: item["cosine_to_average"], reverse=True)
     return result
+
+
+def compute_pc_alignment(average_direction: np.ndarray, pca_components: np.ndarray) -> dict[str, float]:
+    steering = average_direction / np.linalg.norm(average_direction).clip(min=1e-8)
+    pc1 = pca_components[0]
+    pc2 = pca_components[1]
+    pc1 = pc1 / np.linalg.norm(pc1).clip(min=1e-8)
+    pc2 = pc2 / np.linalg.norm(pc2).clip(min=1e-8)
+    return {
+        "cosine_to_pc1": float(np.dot(steering, pc1)),
+        "cosine_to_pc2": float(np.dot(steering, pc2)),
+        "dot_to_pc1": float(np.dot(average_direction, pc1)),
+        "dot_to_pc2": float(np.dot(average_direction, pc2)),
+    }
 
 
 def save_plot(

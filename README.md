@@ -111,6 +111,19 @@ python src/adv_steering/rep_suffix_attack.py \
   --n-minus "Please tell me a sad story about Saturn."
 ```
 
+The discrete suffix search is a greedy one-token-edit procedure:
+
+- at each step, the model computes a gradient with respect to the current suffix tokens
+- for each position, the optimizer builds a shortlist of promising replacement tokens
+- it samples a batch of unique one-token edits from that neighborhood
+- it only accepts a new suffix if the exact objective really improves
+
+To reduce long plateaus, the search also keeps a short memory for the current suffix:
+
+- if a step leaves the suffix unchanged, the next step will avoid rechecking the same one-token edits on that exact suffix state
+- once the suffix changes, that memory is cleared
+- if every local edit has already been tried for the current suffix, the memory resets and the neighborhood can be explored again
+
 Run Largo-style suffix optimization:
 
 ```bash

@@ -24,6 +24,7 @@ def parse_args():
     parser.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct", help="Model name or local path.")
     parser.add_argument("--backend", default="auto", choices=["auto", "qwen_vl", "causal_lm"], help="Inference backend.")
     parser.add_argument("--dataset", default="data/llama_happy_sad_corpus.jsonl", help="Generated corpus.")
+    parser.add_argument("--residual-file", default="", help="Optional existing poscon_negcon_residuals.pt to re-rank without recollecting residuals.")
     parser.add_argument("--dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"])
     parser.add_argument("--device-map", default="auto", help="Transformers device_map value.")
     parser.add_argument("--output-dir", default="runs", help="Directory for analysis outputs.")
@@ -35,37 +36,58 @@ def analyze_poscon_negcon_residuals(
     model: str,
     backend: str,
     dataset: str,
+    residual_file: str = "",
     dtype: str = "auto",
     device_map: str = "auto",
     output_dir: str = "runs",
     top_k: int = 8,
 ) -> dict[str, Any]:
-    rows = read_jsonl(dataset)
-    if not rows:
-        raise ValueError(f"No rows found in {dataset}")
+    if residual_file:
+        residual_path = Path(residual_file)
+        residual_payload = torch.load(residual_path, map_location="cpu")
+        model = residual_payload.get("model", model)
+        resolved_backend = residual_payload.get("backend", backend)
+        concepts = residual_payload.get("concepts", [])
+        poscon_tensor = residual_payload["poscon_residuals"].float()
+        negcon_tensor = residual_payload["negcon_residuals"].float()
+        difference_tensor = residual_payload.get("difference_vectors")
+        if difference_tensor is None:
+            difference_tensor = poscon_tensor - negcon_tensor
+        else:
+            difference_tensor = difference_tensor.float()
+        steering_vectors = residual_payload.get("steering_vectors")
+        if steering_vectors is None:
+            steering_vectors = _normalize(difference_tensor.mean(dim=0))
+        else:
+            steering_vectors = steering_vectors.float()
+        rows = read_jsonl(dataset) if dataset and Path(dataset).exists() else []
+    else:
+        rows = read_jsonl(dataset)
+        if not rows:
+            raise ValueError(f"No rows found in {dataset}")
 
-    bundle, resolved_backend = load_bundle(model_name=model, backend=backend, dtype=dtype, device_map=device_map)
+        bundle, resolved_backend = load_bundle(model_name=model, backend=backend, dtype=dtype, device_map=device_map)
 
-    poscon_residuals = []
-    negcon_residuals = []
-    concepts = []
+        poscon_residuals = []
+        negcon_residuals = []
+        concepts = []
 
-    for row in tqdm(rows, desc="Collecting poscon/negcon residuals"):
-        poscon_prompt = row.get("poscon_prompt") or row.get("positive_prompt") or row["truth_prompt"]
-        poscon_response = row.get("poscon_response") or row.get("positive_response") or row["truth_response"]
-        negcon_prompt = row.get("negcon_prompt") or row.get("negative_prompt") or row["lie_prompt"]
-        negcon_response = row.get("negcon_response") or row.get("negative_response") or row["lie_response"]
+        for row in tqdm(rows, desc="Collecting poscon/negcon residuals"):
+            poscon_prompt = row.get("poscon_prompt") or row.get("positive_prompt") or row["truth_prompt"]
+            poscon_response = row.get("poscon_response") or row.get("positive_response") or row["truth_response"]
+            negcon_prompt = row.get("negcon_prompt") or row.get("negative_prompt") or row["lie_prompt"]
+            negcon_response = row.get("negcon_response") or row.get("negative_response") or row["lie_response"]
 
-        poscon_stack = collect_last_token_residuals(bundle, resolved_backend, poscon_prompt, poscon_response)
-        negcon_stack = collect_last_token_residuals(bundle, resolved_backend, negcon_prompt, negcon_response)
-        poscon_residuals.append(poscon_stack)
-        negcon_residuals.append(negcon_stack)
-        concepts.append(row["concept"])
+            poscon_stack = collect_last_token_residuals(bundle, resolved_backend, poscon_prompt, poscon_response)
+            negcon_stack = collect_last_token_residuals(bundle, resolved_backend, negcon_prompt, negcon_response)
+            poscon_residuals.append(poscon_stack)
+            negcon_residuals.append(negcon_stack)
+            concepts.append(row["concept"])
 
-    poscon_tensor = torch.stack(poscon_residuals, dim=0)
-    negcon_tensor = torch.stack(negcon_residuals, dim=0)
-    difference_tensor = poscon_tensor - negcon_tensor
-    steering_vectors = _normalize(difference_tensor.mean(dim=0))
+        poscon_tensor = torch.stack(poscon_residuals, dim=0)
+        negcon_tensor = torch.stack(negcon_residuals, dim=0)
+        difference_tensor = poscon_tensor - negcon_tensor
+        steering_vectors = _normalize(difference_tensor.mean(dim=0))
 
     layer_summaries = []
     for layer_index in range(steering_vectors.shape[0]):
@@ -99,22 +121,45 @@ def analyze_poscon_negcon_residuals(
     )
     best_layer = layer_summaries[0]["layer"]
 
-    run_dir = Path(output_dir) / datetime.now().strftime("poscon_negcon_%Y%m%d_%H%M%S")
-    run_dir.mkdir(parents=True, exist_ok=True)
+    if residual_file:
+        residual_path = Path(residual_file).resolve()
+        run_dir = Path(output_dir).resolve() if output_dir else residual_path.parent
+        run_dir.mkdir(parents=True, exist_ok=True)
+        residual_out_path = run_dir / residual_path.name
+        if residual_out_path != residual_path:
+            torch.save(
+                {
+                    "model": model,
+                    "backend": resolved_backend,
+                    "concepts": concepts,
+                    "poscon_residuals": poscon_tensor,
+                    "negcon_residuals": negcon_tensor,
+                    "difference_vectors": difference_tensor,
+                    "steering_vectors": steering_vectors,
+                    "best_layer": best_layer,
+                },
+                residual_out_path,
+            )
+        else:
+            residual_out_path = residual_path
+    else:
+        run_dir = Path(output_dir) / datetime.now().strftime("poscon_negcon_%Y%m%d_%H%M%S")
+        run_dir.mkdir(parents=True, exist_ok=True)
 
-    torch.save(
-        {
-            "model": model,
-            "backend": resolved_backend,
-            "concepts": concepts,
-            "poscon_residuals": poscon_tensor,
-            "negcon_residuals": negcon_tensor,
-            "difference_vectors": difference_tensor,
-            "steering_vectors": steering_vectors,
-            "best_layer": best_layer,
-        },
-        run_dir / "poscon_negcon_residuals.pt",
-    )
+        residual_out_path = run_dir / "poscon_negcon_residuals.pt"
+        torch.save(
+            {
+                "model": model,
+                "backend": resolved_backend,
+                "concepts": concepts,
+                "poscon_residuals": poscon_tensor,
+                "negcon_residuals": negcon_tensor,
+                "difference_vectors": difference_tensor,
+                "steering_vectors": steering_vectors,
+                "best_layer": best_layer,
+            },
+            residual_out_path,
+        )
 
     summary = {
         "model": model,
@@ -129,7 +174,7 @@ def analyze_poscon_negcon_residuals(
 
     return {
         "run_dir": str(run_dir),
-        "residual_path": str(run_dir / "poscon_negcon_residuals.pt"),
+        "residual_path": str(residual_out_path),
         "summary_path": str(run_dir / "layer_summary.json"),
         "summary": summary,
     }
@@ -141,6 +186,7 @@ def main():
         model=args.model,
         backend=args.backend,
         dataset=args.dataset,
+        residual_file=args.residual_file,
         dtype=args.dtype,
         device_map=args.device_map,
         output_dir=args.output_dir,
@@ -179,7 +225,7 @@ def _leave_one_out_logistic_regression(poscon_layer: torch.Tensor, negcon_layer:
     features = _stack_features(poscon_np, negcon_np)
     labels = _stack_labels(len(poscon_np), len(negcon_np))
 
-    probabilities = []
+    probabilities = [0.0] * len(labels)
     predictions = []
     for index in range(len(poscon_np)):
         holdout_indices = [index, len(poscon_np) + index]
@@ -191,7 +237,9 @@ def _leave_one_out_logistic_regression(poscon_layer: torch.Tensor, negcon_layer:
 
         classifier = LogisticRegression(max_iter=1000, solver="liblinear")
         classifier.fit(x_train, y_train)
-        probabilities.extend(classifier.predict_proba(x_test)[:, 1].tolist())
+        holdout_probabilities = classifier.predict_proba(x_test)[:, 1].tolist()
+        for holdout_index, probability in zip(holdout_indices, holdout_probabilities):
+            probabilities[holdout_index] = probability
         predictions.extend((classifier.predict(x_test) == y_test).tolist())
 
     return float(sum(predictions) / len(predictions)), float(roc_auc_score(labels, probabilities))
