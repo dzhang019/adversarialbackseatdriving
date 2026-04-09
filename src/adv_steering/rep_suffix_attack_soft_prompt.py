@@ -42,6 +42,7 @@ def parse_args():
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--init-mode", default="zeros", choices=["zeros", "random_tokens"])
+    parser.add_argument("--save-all-steps", action="store_true", help="Store the full soft prompt matrix at every optimization step.")
     parser.add_argument("--output", default="")
     return parser.parse_args()
 
@@ -96,6 +97,7 @@ def main():
         inner_steps=args.inner_steps,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
+        save_all_steps=args.save_all_steps,
     )
 
     payload = {
@@ -111,6 +113,7 @@ def main():
         "inner_steps": args.inner_steps,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
+        "save_all_steps": args.save_all_steps,
         "best_objective": best["objective"],
         "best_step": best["step"],
         "final_objective": trace[-1]["objective"] if trace else None,
@@ -166,6 +169,7 @@ def optimize_soft_prompt(
     inner_steps: int,
     learning_rate: float,
     weight_decay: float,
+    save_all_steps: bool,
 ):
     embedding_layer = bundle.model.get_input_embeddings()
     soft_prompt_parameter = torch.nn.Parameter(soft_prompt.detach().clone().float())
@@ -216,6 +220,7 @@ def optimize_soft_prompt(
                 "term_breakdown": totals or {},
                 "grad_norm": grad_norm,
                 "soft_prompt_norm": float(soft_prompt_parameter.detach().norm().item()),
+                "soft_prompt": soft_prompt_parameter.detach().cpu().tolist() if save_all_steps else None,
             }
         )
         print(

@@ -51,7 +51,7 @@ def main():
     suffix_path = resolve_suffix_path(args.suffix, output_path.parent if output_path else None) if args.suffix else ""
     suffix_info = load_suffix_artifact(suffix_path, args.step, args.exact_suffix_ids) if suffix_path else {"suffix_text": "", "suffix_token_ids": None}
     soft_prompt_path = resolve_suffix_path(args.soft_prompt, output_path.parent if output_path else None) if args.soft_prompt else ""
-    soft_prompt_matrix = load_soft_prompt_artifact(soft_prompt_path) if soft_prompt_path else None
+    soft_prompt_matrix = load_soft_prompt_artifact(soft_prompt_path, args.step) if soft_prompt_path else None
     suffix_text = suffix_info["suffix_text"]
     suffix_token_ids = suffix_info["suffix_token_ids"]
     response_targets = load_response_targets(args.response_targets) if args.response_targets else None
@@ -301,9 +301,17 @@ def load_suffix_artifact(path: str, step: int, exact_suffix_ids: bool) -> dict:
     return {"suffix_text": suffix_text, "suffix_token_ids": suffix_token_ids}
 
 
-def load_soft_prompt_artifact(path: str) -> torch.Tensor:
+def load_soft_prompt_artifact(path: str, step: int) -> torch.Tensor:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    soft_prompt = payload.get("soft_prompt")
+    trace = payload.get("trace", [])
+    soft_prompt = None
+    if trace:
+        index = step if step >= 0 else len(trace) - 1
+        if index < 0 or index >= len(trace):
+            raise ValueError(f"step={step} is out of range for soft-prompt trace length {len(trace)}")
+        soft_prompt = trace[index].get("soft_prompt")
+    if soft_prompt is None:
+        soft_prompt = payload.get("soft_prompt")
     if soft_prompt is None:
         raise ValueError("Soft prompt artifact does not contain a 'soft_prompt' matrix.")
     tensor = torch.tensor(soft_prompt, dtype=torch.float32)
@@ -565,22 +573,17 @@ def generate_generation_result_from_soft_prompt(
         )
         return traced["text"], traced["token_trace"]
 
-    generation_kwargs = {
-        "inputs_embeds": input_embeds,
-        "attention_mask": attention_mask,
-        "max_new_tokens": max_new_tokens,
-        "do_sample": False,
-        "pad_token_id": bundle.tokenizer.pad_token_id,
-    }
-    context = (
-        steering_hook(bundle.model, layer, steering_vector.to(bundle.device), scale)
-        if steering_vector is not None and layer is not None
-        else null_hook()
+    traced = generate_text_with_top_logits_from_input_embeds(
+        bundle=bundle,
+        input_embeds=input_embeds,
+        attention_mask=attention_mask,
+        max_new_tokens=max_new_tokens,
+        top_k=1,
+        steering_vector=steering_vector,
+        layer=layer,
+        scale=scale,
     )
-    with context:
-        generated = bundle.model.generate(**generation_kwargs)
-    new_tokens = generated[0][input_embeds.shape[1] :]
-    return bundle.tokenizer.decode(new_tokens, skip_special_tokens=True).strip(), []
+    return traced["text"], []
 
 
 def generate_generation_result_from_suffix_ids(
