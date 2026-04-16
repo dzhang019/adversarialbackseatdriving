@@ -71,8 +71,9 @@ def generate_text_with_steering(
     max_new_tokens: int = 64,
     do_sample: bool = False,
     temperature: float = 1.0,
+    all_tokens_steer: bool = True,
 ) -> str:
-    with steering_hook(bundle.model, layer, steering_vector.to(bundle.device), scale):
+    with steering_hook(bundle.model, layer, steering_vector.to(bundle.device), scale, all_tokens=all_tokens_steer):
         return generate_text(
             bundle=bundle,
             prompt=prompt,
@@ -91,6 +92,7 @@ def generate_text_with_top_logits(
     steering_vector: torch.Tensor | None = None,
     layer: int | None = None,
     scale: float = 0.0,
+    all_tokens_steer: bool = True,
 ) -> dict[str, Any]:
     encoded = encode_chat_prompt(bundle, prompt, add_generation_prompt=True)
     input_ids = encoded["input_ids"]
@@ -99,7 +101,7 @@ def generate_text_with_top_logits(
     trace: list[dict[str, Any]] = []
 
     context = (
-        steering_hook(bundle.model, layer, steering_vector.to(bundle.device), scale)
+        steering_hook(bundle.model, layer, steering_vector.to(bundle.device), scale, all_tokens=all_tokens_steer)
         if steering_vector is not None and layer is not None
         else null_hook()
     )
@@ -280,7 +282,7 @@ def get_transformer_layers(model: AutoModelForCausalLM):
 
 
 @contextmanager
-def steering_hook(model, layer_index: int, steering_vector: torch.Tensor, scale: float):
+def steering_hook(model, layer_index: int, steering_vector: torch.Tensor, scale: float, all_tokens: bool = True):
     layers = get_transformer_layers(model)
     layer = layers[layer_index]
     vector = steering_vector.to(next(model.parameters()).device)
@@ -289,10 +291,18 @@ def steering_hook(model, layer_index: int, steering_vector: torch.Tensor, scale:
         if isinstance(output, tuple):
             hidden_states = output[0]
             typed_vector = vector.to(hidden_states.dtype)
-            updated = hidden_states + (scale * typed_vector).view(1, 1, -1)
+            if all_tokens:
+                updated = hidden_states + (scale * typed_vector).view(1, 1, -1)
+            else:
+                updated = hidden_states.clone()
+                updated[:, -1, :] = hidden_states[:, -1, :] + (scale * typed_vector)
             return (updated, *output[1:])
         typed_vector = vector.to(output.dtype)
-        return output + (scale * typed_vector).view(1, 1, -1)
+        if all_tokens:
+            return output + (scale * typed_vector).view(1, 1, -1)
+        updated = output.clone()
+        updated[:, -1, :] = output[:, -1, :] + (scale * typed_vector)
+        return updated
 
     handle = layer.register_forward_hook(hook)
     try:

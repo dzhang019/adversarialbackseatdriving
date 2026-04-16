@@ -32,13 +32,23 @@ def generate_text(bundle, backend: str, prompt: str, max_new_tokens: int, do_sam
     return text_backend.generate_text(bundle, prompt, max_new_tokens=max_new_tokens, do_sample=do_sample, temperature=temperature)
 
 
-def generate_text_with_steering(bundle, backend: str, prompt: str, layer: int, steering_vector, scale: float, max_new_tokens: int, do_sample: bool, temperature: float) -> str:
+def generate_text_with_steering(bundle, backend: str, prompt: str, layer: int, steering_vector, scale: float, max_new_tokens: int, do_sample: bool, temperature: float, all_tokens_steer: bool = True) -> str:
     if backend == "qwen_vl":
         return qwen_vl.generate_text_with_steering(bundle, prompt, layer=layer, steering_vector=steering_vector, scale=scale, max_new_tokens=max_new_tokens, do_sample=do_sample, temperature=temperature)
-    return text_backend.generate_text_with_steering(bundle, prompt, layer=layer, steering_vector=steering_vector, scale=scale, max_new_tokens=max_new_tokens, do_sample=do_sample, temperature=temperature)
+    return text_backend.generate_text_with_steering(
+        bundle,
+        prompt,
+        layer=layer,
+        steering_vector=steering_vector,
+        scale=scale,
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        temperature=temperature,
+        all_tokens_steer=all_tokens_steer,
+    )
 
 
-def generate_text_with_top_logits(bundle, backend: str, prompt: str, max_new_tokens: int, top_k: int, steering_vector=None, layer: int | None = None, scale: float = 0.0):
+def generate_text_with_top_logits(bundle, backend: str, prompt: str, max_new_tokens: int, top_k: int, steering_vector=None, layer: int | None = None, scale: float = 0.0, all_tokens_steer: bool = True):
     if backend == "qwen_vl":
         raise ValueError("Top-logit tracing is currently only supported for the causal_lm backend.")
     return text_backend.generate_text_with_top_logits(
@@ -49,6 +59,7 @@ def generate_text_with_top_logits(bundle, backend: str, prompt: str, max_new_tok
         steering_vector=steering_vector,
         layer=layer,
         scale=scale,
+        all_tokens_steer=all_tokens_steer,
     )
 
 

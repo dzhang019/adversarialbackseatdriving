@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 from dataclasses import asdict
 from datetime import datetime
 import json
@@ -24,6 +25,7 @@ def parse_args():
     parser.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct", help="Model name or local path.")
     parser.add_argument("--backend", default="auto", choices=["auto", "qwen_vl", "causal_lm"], help="Inference backend.")
     parser.add_argument("--steering-file", default="runs/poscon_negcon/latest/poscon_negcon_residuals.pt", help="Path to poscon_negcon_residuals.pt or steering_candidates.pt.")
+    parser.add_argument("--steering-config", default="", help="Optional JSON file listing multiple steering entries with layer and coefficient/scale. When provided, overrides the single-layer steering path.")
     parser.add_argument("--layer", type=int, default=0, help="Layer to steer.")
     parser.add_argument("--poscon-scale", type=float, default=3.0, help="Scale for positive-concept steering.")
     parser.add_argument("--negcon-scale", type=float, default=-3.0, help="Scale for negative-concept steering.")
@@ -34,6 +36,8 @@ def parse_args():
     parser.add_argument("--dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"])
     parser.add_argument("--device-map", default="auto", help="Transformers device_map value.")
     parser.add_argument("--max-new-tokens", type=int, default=64, help="Maximum number of new tokens.")
+    parser.add_argument("--all-tokens-steer", action="store_true", help="Apply steering to all token positions in each forward pass. By default, generation only steers the current last token.")
+    parser.add_argument("--last-prompt-token-steering", action="store_true", help="Apply steering only once, on the final prompt token that predicts the first generated token.")
     parser.add_argument("--show-top-logits", action="store_true", help="Print the top next-token logits at each generation step.")
     parser.add_argument("--top-logits-k", type=int, default=10, help="How many logits to print per generation step when --show-top-logits is enabled.")
     parser.add_argument("--response-targets", default="", help="Optional JSON file with fixed positive/neutral/negative responses for teacher-forced CE scoring.")
@@ -48,6 +52,8 @@ def main():
     output_path = resolve_output_path(args.output, args.steering_file)
     if args.suffix and args.soft_prompt:
         raise ValueError("Use at most one of --suffix or --soft-prompt.")
+    if args.all_tokens_steer and args.last_prompt_token_steering:
+        raise ValueError("Use at most one of --all-tokens-steer or --last-prompt-token-steering.")
     suffix_path = resolve_suffix_path(args.suffix, output_path.parent if output_path else None) if args.suffix else ""
     suffix_info = load_suffix_artifact(suffix_path, args.step, args.exact_suffix_ids) if suffix_path else {"suffix_text": "", "suffix_token_ids": None}
     soft_prompt_path = resolve_suffix_path(args.soft_prompt, output_path.parent if output_path else None) if args.soft_prompt else ""
@@ -55,7 +61,8 @@ def main():
     suffix_text = suffix_info["suffix_text"]
     suffix_token_ids = suffix_info["suffix_token_ids"]
     response_targets = load_response_targets(args.response_targets) if args.response_targets else None
-    steering_vector = load_steering_vector(args.steering_file, args.layer)
+    steering_entries = load_steering_entries(args.steering_config, args.steering_file) if args.steering_config else None
+    steering_vector = None if steering_entries is not None else load_steering_vector(args.steering_file, args.layer)
     bundle, resolved_backend = load_bundle(model_name=args.model, backend=args.backend, dtype=args.dtype, device_map=args.device_map)
     if args.exact_suffix_ids and resolved_backend != "causal_lm":
         raise ValueError("--exact-suffix-ids is currently only supported for the causal_lm backend.")
@@ -66,6 +73,7 @@ def main():
         "model": args.model,
         "backend": resolved_backend,
         "steering_file": args.steering_file,
+        "steering_config": args.steering_config,
         "layer": args.layer,
         "poscon_scale": args.poscon_scale,
         "negcon_scale": args.negcon_scale,
@@ -76,6 +84,8 @@ def main():
         "dtype": args.dtype,
         "device_map": args.device_map,
         "max_new_tokens": args.max_new_tokens,
+        "all_tokens_steer": args.all_tokens_steer,
+        "last_prompt_token_steering": args.last_prompt_token_steering,
         "show_top_logits": args.show_top_logits,
         "top_logits_k": args.top_logits_k,
         "response_targets_path": args.response_targets,
@@ -84,6 +94,14 @@ def main():
         "suffix_text": suffix_text,
         "suffix_token_ids": suffix_token_ids,
         "soft_prompt_shape": None if soft_prompt_matrix is None else list(soft_prompt_matrix.shape),
+        "steering_entries": None if steering_entries is None else [
+            {
+                "layer": entry["layer"],
+                "scale": entry["scale"],
+                "steering_file": entry["steering_file"],
+            }
+            for entry in steering_entries
+        ],
     }
 
     results = []
@@ -108,6 +126,9 @@ def main():
             top_logits_k=args.top_logits_k,
             suffix_token_ids=suffix_token_ids,
             soft_prompt_matrix=soft_prompt_matrix,
+            all_tokens_steer=args.all_tokens_steer,
+            last_prompt_token_steering=args.last_prompt_token_steering,
+            steering_entries=None,
         )
         print("  baseline done", flush=True)
         poscon_steered, poscon_trace = generate_generation_result(
@@ -122,6 +143,9 @@ def main():
             scale=args.poscon_scale,
             suffix_token_ids=suffix_token_ids,
             soft_prompt_matrix=soft_prompt_matrix,
+            all_tokens_steer=args.all_tokens_steer,
+            last_prompt_token_steering=args.last_prompt_token_steering,
+            steering_entries=scale_steering_entries(steering_entries, sign=1.0) if steering_entries is not None else None,
         )
         print("  poscon-steered done", flush=True)
         negcon_steered, negcon_trace = generate_generation_result(
@@ -136,6 +160,9 @@ def main():
             scale=args.negcon_scale,
             suffix_token_ids=suffix_token_ids,
             soft_prompt_matrix=soft_prompt_matrix,
+            all_tokens_steer=args.all_tokens_steer,
+            last_prompt_token_steering=args.last_prompt_token_steering,
+            steering_entries=scale_steering_entries(steering_entries, sign=-1.0) if steering_entries is not None else None,
         )
         print("  negcon-steered done", flush=True)
         if args.show_top_logits:
@@ -152,6 +179,7 @@ def main():
                     response_targets=response_targets,
                     suffix_token_ids=suffix_token_ids,
                     soft_prompt_matrix=soft_prompt_matrix,
+                    steering_entries=scale_steering_entries(steering_entries, sign=1.0) if steering_entries is not None else None,
                 ),
                 "poscon_steered": compute_response_target_cross_entropy(
                     bundle=bundle,
@@ -163,6 +191,7 @@ def main():
                     scale=args.poscon_scale,
                     suffix_token_ids=suffix_token_ids,
                     soft_prompt_matrix=soft_prompt_matrix,
+                    steering_entries=scale_steering_entries(steering_entries, sign=1.0) if steering_entries is not None else None,
                 ),
                 "negcon_steered": compute_response_target_cross_entropy(
                     bundle=bundle,
@@ -174,6 +203,7 @@ def main():
                     scale=args.negcon_scale,
                     suffix_token_ids=suffix_token_ids,
                     soft_prompt_matrix=soft_prompt_matrix,
+                    steering_entries=scale_steering_entries(steering_entries, sign=-1.0) if steering_entries is not None else None,
                 ),
             }
             print_target_cross_entropy(target_cross_entropy)
@@ -248,6 +278,52 @@ def load_response_targets(path: str) -> dict[str, str]:
         "neutral_response": neutral,
         "negative_response": negative,
     }
+
+
+def load_steering_entries(path: str, default_steering_file: str) -> list[dict]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(payload, dict):
+        entries = payload.get("entries") or payload.get("layers") or payload.get("steering") or []
+    elif isinstance(payload, list):
+        entries = payload
+    else:
+        raise ValueError("steering-config must be a JSON list or dict containing an entries/layers/steering list.")
+    if not entries:
+        raise ValueError(f"No steering entries found in {path}")
+
+    normalized = []
+    for index, row in enumerate(entries):
+        if not isinstance(row, dict):
+            raise ValueError(f"steering-config entry {index} must be an object.")
+        if "layer" not in row:
+            raise ValueError(f"steering-config entry {index} is missing 'layer'.")
+        scale = row.get("scale", row.get("coefficient", row.get("weight")))
+        if scale is None:
+            raise ValueError(f"steering-config entry {index} must provide scale/coefficient/weight.")
+        steering_file = row.get("steering_file") or row.get("path") or default_steering_file
+        normalized.append(
+            {
+                "layer": int(row["layer"]),
+                "scale": float(scale),
+                "steering_file": steering_file,
+                "vector": load_steering_vector(steering_file, int(row["layer"])),
+            }
+        )
+    return normalized
+
+
+def scale_steering_entries(entries: list[dict] | None, sign: float) -> list[dict] | None:
+    if entries is None:
+        return None
+    return [
+        {
+            "layer": entry["layer"],
+            "scale": sign * float(entry["scale"]),
+            "steering_file": entry["steering_file"],
+            "vector": entry["vector"],
+        }
+        for entry in entries
+    ]
 
 
 def load_suffix_text(path: str, step: int) -> str:
@@ -407,6 +483,7 @@ def compute_response_target_cross_entropy(
     scale: float = 0.0,
     suffix_token_ids: list[int] | None = None,
     soft_prompt_matrix: torch.Tensor | None = None,
+    steering_entries: list[dict] | None = None,
 ) -> dict[str, float]:
     if backend != "causal_lm":
         raise ValueError("Fixed-response cross-entropy scoring is currently only supported for the causal_lm backend.")
@@ -421,6 +498,7 @@ def compute_response_target_cross_entropy(
             scale=scale,
             suffix_token_ids=suffix_token_ids,
             soft_prompt_matrix=soft_prompt_matrix,
+            steering_entries=steering_entries,
         )
     return scores
 
@@ -435,6 +513,7 @@ def compute_teacher_forced_cross_entropy(
     scale: float = 0.0,
     suffix_token_ids: list[int] | None = None,
     soft_prompt_matrix: torch.Tensor | None = None,
+    steering_entries: list[dict] | None = None,
 ) -> float:
     embedding_layer = bundle.model.get_input_embeddings()
     if suffix_token_ids is not None:
@@ -453,10 +532,13 @@ def compute_teacher_forced_cross_entropy(
         [attention_mask, torch.ones_like(target_ids, device=bundle.device, dtype=attention_mask.dtype)],
         dim=1,
     )
-    context = (
-        steering_hook(bundle.model, layer, steering_vector.to(bundle.device), scale)
-        if steering_vector is not None and layer is not None
-        else null_hook()
+    context = _combined_steering_context(
+        bundle=bundle,
+        steering_entries=steering_entries,
+        steering_vector=steering_vector,
+        layer=layer,
+        scale=scale,
+        all_tokens_steer=True,
     )
     with context:
         outputs = bundle.model(
@@ -488,6 +570,9 @@ def generate_generation_result(
     scale: float = 0.0,
     suffix_token_ids: list[int] | None = None,
     soft_prompt_matrix: torch.Tensor | None = None,
+    all_tokens_steer: bool = False,
+    last_prompt_token_steering: bool = False,
+    steering_entries: list[dict] | None = None,
 ) -> tuple[str, list[dict]]:
     if soft_prompt_matrix is not None:
         return generate_generation_result_from_soft_prompt(
@@ -501,6 +586,9 @@ def generate_generation_result(
             steering_vector=steering_vector,
             layer=layer,
             scale=scale,
+            all_tokens_steer=all_tokens_steer,
+            last_prompt_token_steering=last_prompt_token_steering,
+            steering_entries=steering_entries,
         )
     if suffix_token_ids is not None:
         return generate_generation_result_from_suffix_ids(
@@ -514,35 +602,72 @@ def generate_generation_result(
             steering_vector=steering_vector,
             layer=layer,
             scale=scale,
+            all_tokens_steer=all_tokens_steer,
+            last_prompt_token_steering=last_prompt_token_steering,
+            steering_entries=steering_entries,
         )
     if show_top_logits:
-        traced = generate_text_with_top_logits(
+        if backend != "causal_lm":
+            traced = generate_text_with_top_logits(
+                bundle=bundle,
+                backend=backend,
+                prompt=prompt,
+                max_new_tokens=max_new_tokens,
+                top_k=top_logits_k,
+                steering_vector=steering_vector,
+                layer=layer,
+                scale=scale,
+                all_tokens_steer=all_tokens_steer,
+            )
+            return traced["text"], traced["token_trace"]
+        prompt_inputs = encode_chat_prompt(bundle, prompt, add_generation_prompt=True)
+        traced = generate_text_with_top_logits_from_input_ids(
             bundle=bundle,
-            backend=backend,
-            prompt=prompt,
+            input_ids=prompt_inputs["input_ids"],
+            attention_mask=prompt_inputs["attention_mask"],
             max_new_tokens=max_new_tokens,
             top_k=top_logits_k,
             steering_vector=steering_vector,
             layer=layer,
             scale=scale,
+            all_tokens_steer=all_tokens_steer,
+            last_prompt_token_steering=last_prompt_token_steering,
+            steering_entries=steering_entries,
         )
         return traced["text"], traced["token_trace"]
-    if steering_vector is None or layer is None:
+    if steering_entries is None and (steering_vector is None or layer is None):
         return generate_text(bundle, backend, prompt, max_new_tokens=max_new_tokens, do_sample=False, temperature=1.0), []
-    return (
-        generate_text_with_steering(
-            bundle,
-            backend,
-            prompt,
-            layer=layer,
-            steering_vector=steering_vector,
-            scale=scale,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            temperature=1.0,
-        ),
-        [],
+    if backend != "causal_lm":
+        return (
+            generate_text_with_steering(
+                bundle,
+                backend,
+                prompt,
+                layer=layer,
+                steering_vector=steering_vector,
+                scale=scale,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                temperature=1.0,
+                all_tokens_steer=all_tokens_steer,
+            ),
+            [],
+        )
+    prompt_inputs = encode_chat_prompt(bundle, prompt, add_generation_prompt=True)
+    traced = generate_text_with_top_logits_from_input_ids(
+        bundle=bundle,
+        input_ids=prompt_inputs["input_ids"],
+        attention_mask=prompt_inputs["attention_mask"],
+        max_new_tokens=max_new_tokens,
+        top_k=1,
+        steering_vector=steering_vector,
+        layer=layer,
+        scale=scale,
+        all_tokens_steer=all_tokens_steer,
+        last_prompt_token_steering=last_prompt_token_steering,
+        steering_entries=steering_entries,
     )
+    return traced["text"], []
 
 
 def generate_generation_result_from_soft_prompt(
@@ -556,6 +681,9 @@ def generate_generation_result_from_soft_prompt(
     steering_vector: torch.Tensor | None = None,
     layer: int | None = None,
     scale: float = 0.0,
+    all_tokens_steer: bool = False,
+    last_prompt_token_steering: bool = False,
+    steering_entries: list[dict] | None = None,
 ) -> tuple[str, list[dict]]:
     if backend != "causal_lm":
         raise ValueError("Soft prompts are currently only supported for causal_lm.")
@@ -570,6 +698,9 @@ def generate_generation_result_from_soft_prompt(
             steering_vector=steering_vector,
             layer=layer,
             scale=scale,
+            all_tokens_steer=all_tokens_steer,
+            last_prompt_token_steering=last_prompt_token_steering,
+            steering_entries=steering_entries,
         )
         return traced["text"], traced["token_trace"]
 
@@ -582,6 +713,9 @@ def generate_generation_result_from_soft_prompt(
         steering_vector=steering_vector,
         layer=layer,
         scale=scale,
+        all_tokens_steer=all_tokens_steer,
+        last_prompt_token_steering=last_prompt_token_steering,
+        steering_entries=steering_entries,
     )
     return traced["text"], []
 
@@ -597,6 +731,9 @@ def generate_generation_result_from_suffix_ids(
     steering_vector: torch.Tensor | None = None,
     layer: int | None = None,
     scale: float = 0.0,
+    all_tokens_steer: bool = False,
+    last_prompt_token_steering: bool = False,
+    steering_entries: list[dict] | None = None,
 ) -> tuple[str, list[dict]]:
     if backend != "causal_lm":
         raise ValueError("Exact suffix ids are currently only supported for causal_lm.")
@@ -611,6 +748,9 @@ def generate_generation_result_from_suffix_ids(
             steering_vector=steering_vector,
             layer=layer,
             scale=scale,
+            all_tokens_steer=all_tokens_steer,
+            last_prompt_token_steering=last_prompt_token_steering,
+            steering_entries=steering_entries,
         )
         return traced["text"], traced["token_trace"]
 
@@ -621,15 +761,20 @@ def generate_generation_result_from_suffix_ids(
         "do_sample": False,
         "pad_token_id": bundle.tokenizer.pad_token_id,
     }
-    context = (
-        steering_hook(bundle.model, layer, steering_vector.to(bundle.device), scale)
-        if steering_vector is not None and layer is not None
-        else null_hook()
+    traced = generate_text_with_top_logits_from_input_ids(
+        bundle=bundle,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=max_new_tokens,
+        top_k=1,
+        steering_vector=steering_vector,
+        layer=layer,
+        scale=scale,
+        all_tokens_steer=all_tokens_steer,
+        last_prompt_token_steering=last_prompt_token_steering,
+        steering_entries=steering_entries,
     )
-    with context:
-        generated = bundle.model.generate(**generation_kwargs)
-    new_tokens = generated[0][input_ids.shape[1] :]
-    return bundle.tokenizer.decode(new_tokens, skip_special_tokens=True).strip(), []
+    return traced["text"], []
 
 
 def print_token_trace(label: str, token_trace: list[dict]) -> None:
@@ -715,18 +860,26 @@ def generate_text_with_top_logits_from_input_ids(
     steering_vector: torch.Tensor | None = None,
     layer: int | None = None,
     scale: float = 0.0,
+    all_tokens_steer: bool = False,
+    last_prompt_token_steering: bool = False,
+    steering_entries: list[dict] | None = None,
 ) -> dict:
     generated_token_ids: list[int] = []
     trace: list[dict] = []
     current_input_ids = input_ids
     current_attention_mask = attention_mask
-    context = (
-        steering_hook(bundle.model, layer, steering_vector.to(bundle.device), scale)
-        if steering_vector is not None and layer is not None
-        else null_hook()
-    )
-    with context:
-        for position in range(max_new_tokens):
+    for position in range(max_new_tokens):
+        context = _generation_step_context(
+            bundle=bundle,
+            steering_vector=steering_vector,
+            layer=layer,
+            scale=scale,
+            all_tokens_steer=all_tokens_steer,
+            last_prompt_token_steering=last_prompt_token_steering,
+            generation_position=position,
+            steering_entries=steering_entries,
+        )
+        with context:
             outputs = bundle.model(
                 input_ids=current_input_ids,
                 attention_mask=current_attention_mask,
@@ -781,19 +934,27 @@ def generate_text_with_top_logits_from_input_embeds(
     steering_vector: torch.Tensor | None = None,
     layer: int | None = None,
     scale: float = 0.0,
+    all_tokens_steer: bool = False,
+    last_prompt_token_steering: bool = False,
+    steering_entries: list[dict] | None = None,
 ) -> dict:
     embedding_layer = bundle.model.get_input_embeddings()
     generated_token_ids: list[int] = []
     trace: list[dict] = []
     current_input_embeds = input_embeds
     current_attention_mask = attention_mask
-    context = (
-        steering_hook(bundle.model, layer, steering_vector.to(bundle.device), scale)
-        if steering_vector is not None and layer is not None
-        else null_hook()
-    )
-    with context:
-        for position in range(max_new_tokens):
+    for position in range(max_new_tokens):
+        context = _generation_step_context(
+            bundle=bundle,
+            steering_vector=steering_vector,
+            layer=layer,
+            scale=scale,
+            all_tokens_steer=all_tokens_steer,
+            last_prompt_token_steering=last_prompt_token_steering,
+            generation_position=position,
+            steering_entries=steering_entries,
+        )
+        with context:
             outputs = bundle.model(
                 inputs_embeds=current_input_embeds,
                 attention_mask=current_attention_mask,
@@ -836,6 +997,79 @@ def generate_text_with_top_logits_from_input_embeds(
         "text": bundle.tokenizer.decode(generated_token_ids, skip_special_tokens=True).strip(),
         "token_trace": trace,
     }
+
+
+def _generation_step_context(
+    bundle,
+    steering_vector: torch.Tensor | None,
+    layer: int | None,
+    scale: float,
+    all_tokens_steer: bool,
+    last_prompt_token_steering: bool,
+    generation_position: int,
+    steering_entries: list[dict] | None = None,
+):
+    if steering_entries is None and (steering_vector is None or layer is None):
+        return null_hook()
+    if last_prompt_token_steering and generation_position > 0:
+        return null_hook()
+    return _combined_steering_context(
+        bundle=bundle,
+        steering_entries=steering_entries,
+        steering_vector=steering_vector,
+        layer=layer,
+        scale=scale,
+        all_tokens_steer=all_tokens_steer,
+    )
+
+
+class multi_hook:
+    def __init__(self, contexts: list):
+        self.contexts = contexts
+        self.stack = ExitStack()
+
+    def __enter__(self):
+        for context in self.contexts:
+            self.stack.enter_context(context)
+        return None
+
+    def __exit__(self, exc_type, exc, tb):
+        return self.stack.__exit__(exc_type, exc, tb)
+
+
+def _combined_steering_context(
+    bundle,
+    steering_entries: list[dict] | None,
+    steering_vector: torch.Tensor | None,
+    layer: int | None,
+    scale: float,
+    all_tokens_steer: bool,
+):
+    contexts = []
+    if steering_entries is not None:
+        for entry in steering_entries:
+            contexts.append(
+                steering_hook(
+                    bundle.model,
+                    entry["layer"],
+                    entry["vector"].to(bundle.device),
+                    entry["scale"],
+                    all_tokens=all_tokens_steer,
+                )
+            )
+    elif steering_vector is not None and layer is not None:
+        contexts.append(
+            steering_hook(
+                bundle.model,
+                layer,
+                steering_vector.to(bundle.device),
+                scale,
+                all_tokens=all_tokens_steer,
+            )
+        )
+    if not contexts:
+        return null_hook()
+    return multi_hook(contexts)
 
 
 def print_results(results: list[dict], layer: int, poscon_scale: float, negcon_scale: float) -> None:
