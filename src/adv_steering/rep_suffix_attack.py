@@ -11,6 +11,9 @@ import sys
 import torch
 import torch.nn.functional as F
 
+DEFAULT_CURRENT_LAST_TOKEN_STEPS = 16
+CURRENT_LAST_TOKEN_STEPS = DEFAULT_CURRENT_LAST_TOKEN_STEPS
+
 if __package__ in (None, ""):
     sys.path.append(str(Path(__file__).resolve().parents[1]))
     from adv_steering.text_backend import TextModelBundle, encode_chat_prompt, load_text_model_bundle, split_chat_prompt_for_user_suffix, steering_hook
@@ -66,6 +69,7 @@ def parse_args():
     parser.add_argument("--steering-scale", type=float, default=8.0, help="Scale of the steering vector used inside the steered cross-entropy objective.")
     parser.add_argument("--prompt-pairs-file", default="", help="Optional JSONL file with prompt pairs. Each row should contain n_plus/n_minus or poscon_prompt/negcon_prompt.")
     parser.add_argument("--steering-file", required=True, help="Path to poscon_negcon_residuals.pt or steering_candidates.pt.")
+    parser.add_argument("--steering-config", default="", help="Optional JSON file listing multiple steering entries with layer and scale/coefficient. For dot/cosine, overrides the single-layer steering objective.")
     parser.add_argument("--layer", type=int, required=True, help="Layer to use for both the steering vector and prompt-state objective.")
     parser.add_argument("--dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"])
     parser.add_argument("--device-map", default="auto", help="Transformers device_map value.")
@@ -74,8 +78,10 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=500, help="Number of optimization iterations.")
     parser.add_argument("--top-k", type=int, default=256, help="How many promising replacement tokens to keep per position.")
     parser.add_argument("--batch-size", type=int, default=512, help="How many one-edit candidate prompts to sample per iteration.")
-    parser.add_argument("--objective-type", default="dot", choices=["dot", "cosine", "steered_ce"], help="Which objective to minimize.")
-    parser.add_argument("--last-prompt-token-steering", action="store_true", help="For steered_ce, steer only the final prompt token instead of all prompt+target token positions.")
+    parser.add_argument("--objective-type", default="dot", choices=["dot", "cosine", "cosine_current_last_token", "steered_ce"], help="Which objective to minimize.")
+    parser.add_argument("--current-last-token-steps", type=int, default=DEFAULT_CURRENT_LAST_TOKEN_STEPS, help="For cosine_current_last_token, how many autoregressive current-last-token steps to average.")
+    parser.add_argument("--all-tokens-steer", action="store_true", help="For steered_ce, steer all prompt+target token positions instead of only the final prompt token.")
+    parser.add_argument("--last-prompt-token-steering", action="store_true", help="For steered_ce, steer only the final prompt token. This is the default behavior.")
     parser.add_argument("--success-threshold", type=float, default=0.0, help="A prompt pair is considered solved when its objective is below this threshold.")
     parser.add_argument("--kl-interval", type=int, default=50, help="Log average next-token KL(base || suffixed) every N steps. Set <= 0 to disable.")
     parser.add_argument("--resume-from", default="", help="Optional suffix artifact JSON to resume from. Reuses its suffix_token_ids and appends to its trace.")
@@ -90,6 +96,7 @@ def optimize_suffix_against_direction(
     layer: int,
     suffix_length: int,
     steps: int,
+    steering_targets: list[dict] | None = None,
     top_k: int = 256,
     batch_size: int = 512,
     objective_type: str = "dot",
@@ -154,6 +161,7 @@ def optimize_suffix_against_direction(
             suffix_token_ids=no_suffix_token_ids,
             steering_vector=steering_vector.to(device),
             layer=layer,
+            steering_targets=steering_targets,
             objective_type=objective_type,
             target_ids=target_ids,
             neutral_prompt_ids=neutral_prompt_ids,
@@ -167,6 +175,7 @@ def optimize_suffix_against_direction(
             suffix_token_ids=fill_suffix_token_ids,
             steering_vector=steering_vector.to(device),
             layer=layer,
+            steering_targets=steering_targets,
             objective_type=objective_type,
             target_ids=target_ids,
             neutral_prompt_ids=neutral_prompt_ids,
@@ -214,6 +223,7 @@ def optimize_suffix_against_direction(
             suffix_token_ids=suffix_token_ids,
             steering_vector=steering_vector.to(device),
             layer=layer,
+            steering_targets=steering_targets,
             objective_type=objective_type,
             target_ids=target_ids,
             neutral_prompt_ids=neutral_prompt_ids,
@@ -226,6 +236,7 @@ def optimize_suffix_against_direction(
             suffix_token_ids=suffix_token_ids,
             steering_vector=steering_vector.to(device),
             layer=layer,
+            steering_targets=steering_targets,
             objective_type=objective_type,
             target_ids=target_ids,
             neutral_prompt_ids=neutral_prompt_ids,
@@ -295,6 +306,7 @@ def optimize_suffix_against_direction(
             candidate_suffix_token_ids=candidate_batch,
             steering_vector=steering_vector.to(device),
             layer=layer,
+            steering_targets=steering_targets,
             objective_type=objective_type,
             target_ids=target_ids,
             neutral_prompt_ids=neutral_prompt_ids,
@@ -309,6 +321,7 @@ def optimize_suffix_against_direction(
             suffix_token_ids=proposed_suffix,
             steering_vector=steering_vector.to(device),
             layer=layer,
+            steering_targets=steering_targets,
             objective_type=objective_type,
             target_ids=target_ids,
             neutral_prompt_ids=neutral_prompt_ids,
@@ -337,6 +350,7 @@ def optimize_suffix_against_direction(
             suffix_token_ids=suffix_token_ids,
             steering_vector=steering_vector.to(device),
             layer=layer,
+            steering_targets=steering_targets,
             objective_type=objective_type,
             target_ids=target_ids,
             neutral_prompt_ids=neutral_prompt_ids,
@@ -349,6 +363,7 @@ def optimize_suffix_against_direction(
             suffix_token_ids=suffix_token_ids,
             steering_vector=steering_vector.to(device),
             layer=layer,
+            steering_targets=steering_targets,
             objective_type=objective_type,
             target_ids=target_ids,
             neutral_prompt_ids=neutral_prompt_ids,
@@ -361,6 +376,7 @@ def optimize_suffix_against_direction(
             suffix_token_ids=suffix_token_ids,
             steering_vector=steering_vector.to(device),
             layer=layer,
+            steering_targets=steering_targets,
         )
         cosine_similarity = _aggregate_cosine_similarity(
             bundle=bundle,
@@ -368,6 +384,14 @@ def optimize_suffix_against_direction(
             suffix_token_ids=suffix_token_ids,
             steering_vector=steering_vector.to(device),
             layer=layer,
+            steering_targets=steering_targets,
+        )
+        per_layer_contributions = _per_layer_config_contributions(
+            bundle=bundle,
+            prompt_pair_ids=active_prompt_pair_ids,
+            suffix_token_ids=suffix_token_ids,
+            steering_targets=steering_targets,
+            objective_type=objective_type,
         )
         next_token_kl = None
         if kl_interval > 0 and step_index % kl_interval == 0:
@@ -379,26 +403,27 @@ def optimize_suffix_against_direction(
         if all(objective < success_threshold for objective in per_prompt_objectives) and active_examples < len(prompt_pair_ids):
             active_examples += 1
 
-        trace.append(
-            asdict(
-                RepSuffixStep(
-                    step=step_offset + step_index,
-                    objective_type=objective_type,
-                    objective=float(logged_objective),
-                    objective_term_1_name=objective_breakdown["term_1_name"],
-                    objective_term_1=float(objective_breakdown["term_1"]),
-                    objective_term_2_name=objective_breakdown["term_2_name"],
-                    objective_term_2=float(objective_breakdown["term_2"]),
-                    objective_term_3_name=objective_breakdown["term_3_name"],
-                    objective_term_3=float(objective_breakdown["term_3"]),
-                    dot_product=float(dot_product),
-                    cosine_similarity=float(cosine_similarity),
-                    next_token_kl=next_token_kl,
-                    suffix_text=tokenizer.decode(suffix_token_ids, skip_special_tokens=True),
-                    active_examples=active_examples,
-                )
+        step_row = asdict(
+            RepSuffixStep(
+                step=step_offset + step_index,
+                objective_type=objective_type,
+                objective=float(logged_objective),
+                objective_term_1_name=objective_breakdown["term_1_name"],
+                objective_term_1=float(objective_breakdown["term_1"]),
+                objective_term_2_name=objective_breakdown["term_2_name"],
+                objective_term_2=float(objective_breakdown["term_2"]),
+                objective_term_3_name=objective_breakdown["term_3_name"],
+                objective_term_3=float(objective_breakdown["term_3"]),
+                dot_product=float(dot_product),
+                cosine_similarity=float(cosine_similarity),
+                next_token_kl=next_token_kl,
+                suffix_text=tokenizer.decode(suffix_token_ids, skip_special_tokens=True),
+                active_examples=active_examples,
             )
         )
+        if per_layer_contributions:
+            step_row["per_layer_contributions"] = per_layer_contributions
+        trace.append(step_row)
         print(
             f"[step {step_offset + step_index + 1}/{step_offset + steps}] "
             f"objective_type={objective_type} "
@@ -436,6 +461,7 @@ def _aggregate_objective_and_suffix_grad(
     steering_vector: torch.Tensor,
     layer: int,
     objective_type: str,
+    steering_targets: list[dict] | None = None,
     target_ids: dict[str, torch.Tensor] | None = None,
     neutral_prompt_ids: torch.Tensor | None = None,
     steering_scale: float = 8.0,
@@ -464,6 +490,21 @@ def _aggregate_objective_and_suffix_grad(
             last_prompt_token_steering=last_prompt_token_steering,
         )
         objective = objective + prompt_objective.float()
+        objective.backward()
+        grad = prefix_embeds.grad[0].detach()
+        return float(objective.detach().item()), grad
+    if steering_targets is not None:
+        for n_plus_ids, n_minus_ids in prompt_pair_ids:
+            plus_prompt_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_plus_ids, prefix_embeds)
+            minus_prompt_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_minus_ids, prefix_embeds)
+            prompt_objective, _ = _multi_layer_prompt_objective_and_terms(
+                bundle=bundle,
+                plus_prompt_embeds=plus_prompt_embeds,
+                minus_prompt_embeds=minus_prompt_embeds,
+                steering_targets=steering_targets,
+                objective_type=objective_type,
+            )
+            objective = objective + prompt_objective.float()
         objective.backward()
         grad = prefix_embeds.grad[0].detach()
         return float(objective.detach().item()), grad
@@ -496,6 +537,7 @@ def _aggregate_suffix_objective(
     steering_vector: torch.Tensor,
     layer: int,
     objective_type: str,
+    steering_targets: list[dict] | None = None,
     target_ids: dict[str, torch.Tensor] | None = None,
     neutral_prompt_ids: torch.Tensor | None = None,
     steering_scale: float = 8.0,
@@ -523,6 +565,19 @@ def _aggregate_suffix_objective(
             last_prompt_token_steering=last_prompt_token_steering,
         )
         return float(prompt_objective.item())
+    if steering_targets is not None:
+        for n_plus_ids, n_minus_ids in prompt_pair_ids:
+            plus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_plus_ids, suffix_embeds)
+            minus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_minus_ids, suffix_embeds)
+            prompt_objective, _ = _multi_layer_prompt_objective_and_terms(
+                bundle=bundle,
+                plus_prompt_embeds=plus_embeds,
+                minus_prompt_embeds=minus_embeds,
+                steering_targets=steering_targets,
+                objective_type=objective_type,
+            )
+            total_objective += float(prompt_objective.item())
+        return total_objective
     for n_plus_ids, n_minus_ids in prompt_pair_ids:
         plus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_plus_ids, suffix_embeds)
         minus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_minus_ids, suffix_embeds)
@@ -550,6 +605,7 @@ def _batched_suffix_objectives(
     steering_vector: torch.Tensor,
     layer: int,
     objective_type: str,
+    steering_targets: list[dict] | None = None,
     target_ids: dict[str, torch.Tensor] | None = None,
     neutral_prompt_ids: torch.Tensor | None = None,
     steering_scale: float = 8.0,
@@ -578,6 +634,19 @@ def _batched_suffix_objectives(
             last_prompt_token_steering=last_prompt_token_steering,
         )
         total_objectives += prompt_objective.float()
+        return total_objectives
+    if steering_targets is not None:
+        for n_plus_ids, n_minus_ids in prompt_pair_ids:
+            plus_embeds = _build_batched_prompt_embeds_with_suffix_from_segments(bundle, n_plus_ids, suffix_embeds)
+            minus_embeds = _build_batched_prompt_embeds_with_suffix_from_segments(bundle, n_minus_ids, suffix_embeds)
+            prompt_objective, _ = _multi_layer_batched_prompt_objective_and_terms(
+                bundle=bundle,
+                plus_prompt_embeds=plus_embeds,
+                minus_prompt_embeds=minus_embeds,
+                steering_targets=steering_targets,
+                objective_type=objective_type,
+            )
+            total_objectives += prompt_objective.float()
         return total_objectives
 
     for n_plus_ids, n_minus_ids in prompt_pair_ids:
@@ -608,6 +677,7 @@ def _aggregate_objective_breakdown(
     steering_vector: torch.Tensor,
     layer: int,
     objective_type: str,
+    steering_targets: list[dict] | None = None,
     target_ids: dict[str, torch.Tensor] | None = None,
     neutral_prompt_ids: torch.Tensor | None = None,
     steering_scale: float = 8.0,
@@ -635,6 +705,25 @@ def _aggregate_objective_breakdown(
             last_prompt_token_steering=last_prompt_token_steering,
         )
         totals = {name: float(value.item()) for name, value in terms.items()}
+        return _term_totals_to_breakdown(objective_type, totals)
+    if steering_targets is not None:
+        for n_plus_ids, n_minus_ids in prompt_pair_ids:
+            plus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_plus_ids, suffix_embeds)
+            minus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_minus_ids, suffix_embeds)
+            _, terms = _multi_layer_prompt_objective_and_terms(
+                bundle=bundle,
+                plus_prompt_embeds=plus_embeds,
+                minus_prompt_embeds=minus_embeds,
+                steering_targets=steering_targets,
+                objective_type=objective_type,
+            )
+            if totals is None:
+                totals = {name: float(value.item()) for name, value in terms.items()}
+            else:
+                for name, value in terms.items():
+                    totals[name] += float(value.item())
+        if totals is None:
+            totals = _empty_term_totals(objective_type)
         return _term_totals_to_breakdown(objective_type, totals)
 
     for n_plus_ids, n_minus_ids in prompt_pair_ids:
@@ -671,6 +760,7 @@ def _per_prompt_objectives(
     steering_vector: torch.Tensor,
     layer: int,
     objective_type: str,
+    steering_targets: list[dict] | None = None,
     target_ids: dict[str, torch.Tensor] | None = None,
     neutral_prompt_ids: torch.Tensor | None = None,
     steering_scale: float = 8.0,
@@ -698,6 +788,19 @@ def _per_prompt_objectives(
             last_prompt_token_steering=last_prompt_token_steering,
         )
         return [float(prompt_objective.item())]
+    if steering_targets is not None:
+        for n_plus_ids, n_minus_ids in prompt_pair_ids:
+            plus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_plus_ids, suffix_embeds)
+            minus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_minus_ids, suffix_embeds)
+            prompt_objective, _ = _multi_layer_prompt_objective_and_terms(
+                bundle=bundle,
+                plus_prompt_embeds=plus_embeds,
+                minus_prompt_embeds=minus_embeds,
+                steering_targets=steering_targets,
+                objective_type=objective_type,
+            )
+            objectives.append(float(prompt_objective.item()))
+        return objectives
     for n_plus_ids, n_minus_ids in prompt_pair_ids:
         plus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_plus_ids, suffix_embeds)
         minus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_minus_ids, suffix_embeds)
@@ -724,11 +827,28 @@ def _aggregate_cosine_similarity(
     suffix_token_ids: torch.Tensor,
     steering_vector: torch.Tensor,
     layer: int,
+    steering_targets: list[dict] | None = None,
 ) -> float:
     embedding_layer = bundle.model.get_input_embeddings()
     if not prompt_pair_ids:
         return 0.0
     suffix_embeds = embedding_layer(suffix_token_ids.unsqueeze(0))
+    if steering_targets is not None:
+        total = 0.0
+        for n_plus_ids, n_minus_ids in prompt_pair_ids:
+            plus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_plus_ids, suffix_embeds)
+            minus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_minus_ids, suffix_embeds)
+            plus_states_by_layer = _last_token_hidden_by_layer_from_embeds(bundle, plus_embeds, [entry["layer"] for entry in steering_targets])
+            minus_states_by_layer = _last_token_hidden_by_layer_from_embeds(bundle, minus_embeds, [entry["layer"] for entry in steering_targets])
+            pair_total = 0.0
+            for entry in steering_targets:
+                difference = (plus_states_by_layer[entry["layer"]] - minus_states_by_layer[entry["layer"]]).float()
+                vector = entry["vector"].to(device=difference.device, dtype=torch.float32)
+                numerator = torch.dot(vector, difference)
+                denominator = vector.norm().clamp_min(1e-8) * difference.norm().clamp_min(1e-8)
+                pair_total += float(entry["weight"] * (numerator / denominator).item())
+            total += pair_total
+        return total
     aggregate_difference = None
     for n_plus_ids, n_minus_ids in prompt_pair_ids:
         plus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_plus_ids, suffix_embeds)
@@ -751,11 +871,28 @@ def _aggregate_dot_product(
     suffix_token_ids: torch.Tensor,
     steering_vector: torch.Tensor,
     layer: int,
+    steering_targets: list[dict] | None = None,
 ) -> float:
     embedding_layer = bundle.model.get_input_embeddings()
     if not prompt_pair_ids:
         return 0.0
     suffix_embeds = embedding_layer(suffix_token_ids.unsqueeze(0))
+    if steering_targets is not None:
+        total = 0.0
+        for n_plus_ids, n_minus_ids in prompt_pair_ids:
+            plus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_plus_ids, suffix_embeds)
+            minus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_minus_ids, suffix_embeds)
+            plus_states_by_layer = _last_token_hidden_by_layer_from_embeds(bundle, plus_embeds, [entry["layer"] for entry in steering_targets])
+            minus_states_by_layer = _last_token_hidden_by_layer_from_embeds(bundle, minus_embeds, [entry["layer"] for entry in steering_targets])
+            pair_total = 0.0
+            for entry in steering_targets:
+                difference = plus_states_by_layer[entry["layer"]] - minus_states_by_layer[entry["layer"]]
+                pair_total += float(
+                    entry["weight"]
+                    * torch.dot(entry["vector"].to(device=difference.device, dtype=difference.dtype), difference).item()
+                )
+            total += pair_total
+        return total
     aggregate_difference = None
     for n_plus_ids, n_minus_ids in prompt_pair_ids:
         plus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_plus_ids, suffix_embeds)
@@ -767,6 +904,67 @@ def _aggregate_dot_product(
 
     typed_steering_vector = steering_vector.to(aggregate_difference.dtype)
     return float(torch.dot(typed_steering_vector, aggregate_difference).item())
+
+
+@torch.no_grad()
+def _per_layer_config_contributions(
+    bundle: TextModelBundle,
+    prompt_pair_ids: list[tuple[torch.Tensor, torch.Tensor]],
+    suffix_token_ids: torch.Tensor,
+    steering_targets: list[dict] | None,
+    objective_type: str,
+) -> list[dict]:
+    if objective_type == "cosine_current_last_token":
+        return []
+    if steering_targets is None or not prompt_pair_ids:
+        return []
+    embedding_layer = bundle.model.get_input_embeddings()
+    suffix_embeds = embedding_layer(suffix_token_ids.unsqueeze(0))
+    layers = [entry["layer"] for entry in steering_targets]
+    rows: list[dict] = []
+
+    for entry_index, entry in enumerate(steering_targets):
+        rows.append(
+            {
+                "entry_index": entry_index,
+                "layer": entry["layer"],
+                "scale": entry["scale"],
+                "weight": entry["weight"],
+                "steering_file": entry["steering_file"],
+                "plus_projection": 0.0,
+                "minus_projection_negated": 0.0,
+                "dot_product": 0.0,
+                "cosine_similarity": 0.0,
+            }
+        )
+
+    for n_plus_ids, n_minus_ids in prompt_pair_ids:
+        plus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_plus_ids, suffix_embeds)
+        minus_embeds = _build_prompt_embeds_with_suffix_from_segments(bundle, n_minus_ids, suffix_embeds)
+        plus_states_by_layer = _last_token_hidden_by_layer_from_embeds(bundle, plus_embeds, layers)
+        minus_states_by_layer = _last_token_hidden_by_layer_from_embeds(bundle, minus_embeds, layers)
+
+        for row, entry in zip(rows, steering_targets):
+            layer = entry["layer"]
+            weight = float(entry["weight"])
+            vector = entry["vector"].to(bundle.device)
+            plus_state = plus_states_by_layer[layer]
+            minus_state = minus_states_by_layer[layer]
+            difference = plus_state - minus_state
+            typed_vector = vector.to(difference.dtype)
+            typed_vector_f32 = vector.to(device=difference.device, dtype=torch.float32)
+
+            row["plus_projection"] += float(weight * torch.dot(typed_vector_f32, plus_state.float()).item())
+            row["minus_projection_negated"] += float(weight * -torch.dot(typed_vector_f32, minus_state.float()).item())
+            row["dot_product"] += float(weight * torch.dot(typed_vector, difference).item())
+
+            if objective_type in {"cosine", "cosine_current_last_token"}:
+                difference_f32 = difference.float()
+                numerator = torch.dot(typed_vector_f32, difference_f32)
+                denominator = typed_vector_f32.norm().clamp_min(1e-8) * difference_f32.norm().clamp_min(1e-8)
+                row["cosine_similarity"] += float(weight * (numerator / denominator).item())
+
+    return rows
 
 
 @torch.no_grad()
@@ -821,6 +1019,7 @@ def _compute_suffix_metrics(
     suffix_token_ids: torch.Tensor,
     steering_vector: torch.Tensor,
     layer: int,
+    steering_targets: list[dict] | None,
     objective_type: str,
     target_ids: dict[str, torch.Tensor] | None,
     neutral_prompt_ids: torch.Tensor | None,
@@ -834,6 +1033,7 @@ def _compute_suffix_metrics(
         suffix_token_ids=suffix_token_ids,
         steering_vector=steering_vector,
         layer=layer,
+        steering_targets=steering_targets,
         objective_type=objective_type,
         target_ids=target_ids,
         neutral_prompt_ids=neutral_prompt_ids,
@@ -841,6 +1041,13 @@ def _compute_suffix_metrics(
         last_prompt_token_steering=last_prompt_token_steering,
     )
     return {
+        "per_layer_contributions": _per_layer_config_contributions(
+            bundle=bundle,
+            prompt_pair_ids=prompt_pair_ids,
+            suffix_token_ids=suffix_token_ids,
+            steering_targets=steering_targets,
+            objective_type=objective_type,
+        ),
         "suffix_text": suffix_text,
         "objective": _aggregate_suffix_objective(
             bundle=bundle,
@@ -848,6 +1055,7 @@ def _compute_suffix_metrics(
             suffix_token_ids=suffix_token_ids,
             steering_vector=steering_vector,
             layer=layer,
+            steering_targets=steering_targets,
             objective_type=objective_type,
             target_ids=target_ids,
             neutral_prompt_ids=neutral_prompt_ids,
@@ -866,6 +1074,7 @@ def _compute_suffix_metrics(
             suffix_token_ids=suffix_token_ids,
             steering_vector=steering_vector,
             layer=layer,
+            steering_targets=steering_targets,
         ),
         "cosine_similarity": _aggregate_cosine_similarity(
             bundle=bundle,
@@ -873,6 +1082,7 @@ def _compute_suffix_metrics(
             suffix_token_ids=suffix_token_ids,
             steering_vector=steering_vector,
             layer=layer,
+            steering_targets=steering_targets,
         ),
         "next_token_kl": _average_next_token_kl(
             bundle=bundle,
@@ -965,7 +1175,7 @@ def _pair_objective(
     if objective_type == "dot":
         typed_steering_vector = steering_vector.to(difference.dtype)
         return torch.dot(typed_steering_vector, difference)
-    if objective_type == "cosine":
+    if objective_type in {"cosine", "cosine_current_last_token"}:
         difference = difference.float()
         typed_steering_vector = steering_vector.to(device=difference.device, dtype=torch.float32)
         numerator = torch.dot(typed_steering_vector, difference)
@@ -984,13 +1194,188 @@ def _batched_pair_objective(
     if objective_type == "dot":
         typed_steering_vector = steering_vector.to(difference.dtype)
         return torch.matmul(difference, typed_steering_vector)
-    if objective_type == "cosine":
+    if objective_type in {"cosine", "cosine_current_last_token"}:
         difference = difference.float()
         typed_steering_vector = steering_vector.to(device=difference.device, dtype=torch.float32)
         numerator = torch.matmul(difference, typed_steering_vector)
         denominator = typed_steering_vector.norm().clamp_min(1e-8) * difference.norm(dim=-1).clamp_min(1e-8)
         return numerator / denominator
     raise ValueError(f"Unsupported objective_type: {objective_type}")
+
+
+def _last_token_hidden_by_layer_from_embeds(
+    bundle: TextModelBundle,
+    prompt_embeds: torch.Tensor,
+    layers: list[int],
+) -> dict[int, torch.Tensor]:
+    attention_mask = torch.ones(prompt_embeds.shape[:2], dtype=torch.long, device=bundle.device)
+    outputs = bundle.model(
+        inputs_embeds=prompt_embeds,
+        attention_mask=attention_mask,
+        output_hidden_states=True,
+        use_cache=False,
+    )
+    last_index = prompt_embeds.shape[1] - 1
+    return {layer: outputs.hidden_states[layer + 1][0, last_index] for layer in layers}
+
+
+def _last_token_hidden_by_layer_from_embeds_batched(
+    bundle: TextModelBundle,
+    prompt_embeds: torch.Tensor,
+    layers: list[int],
+) -> dict[int, torch.Tensor]:
+    attention_mask = torch.ones(prompt_embeds.shape[:2], dtype=torch.long, device=bundle.device)
+    outputs = bundle.model(
+        inputs_embeds=prompt_embeds,
+        attention_mask=attention_mask,
+        output_hidden_states=True,
+        use_cache=False,
+    )
+    last_index = prompt_embeds.shape[1] - 1
+    return {layer: outputs.hidden_states[layer + 1][:, last_index, :] for layer in layers}
+
+
+def _multi_layer_prompt_objective_and_terms(
+    bundle: TextModelBundle,
+    plus_prompt_embeds: torch.Tensor,
+    minus_prompt_embeds: torch.Tensor,
+    steering_targets: list[dict],
+    objective_type: str,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    if objective_type == "cosine_current_last_token":
+        layers = [entry["layer"] for entry in steering_targets]
+        plus_states_by_layer = _current_last_token_hidden_by_layer_sequence_from_embeds(
+            bundle=bundle,
+            prompt_embeds=plus_prompt_embeds,
+            layers=layers,
+            num_steps=CURRENT_LAST_TOKEN_STEPS,
+        )
+        minus_states_by_layer = _current_last_token_hidden_by_layer_sequence_from_embeds(
+            bundle=bundle,
+            prompt_embeds=minus_prompt_embeds,
+            layers=layers,
+            num_steps=CURRENT_LAST_TOKEN_STEPS,
+        )
+        objective = torch.zeros((), device=bundle.device, dtype=torch.float32)
+        for entry in steering_targets:
+            layer = entry["layer"]
+            weight = float(entry["weight"])
+            vector = entry["vector"].to(device=bundle.device, dtype=torch.float32).unsqueeze(0)
+            step_scores = []
+            for plus_state, minus_state in zip(plus_states_by_layer[layer], minus_states_by_layer[layer]):
+                difference = (plus_state - minus_state).float()
+                step_scores.append(F.cosine_similarity(difference, vector, dim=-1)[0])
+            objective = objective + (weight * torch.stack(step_scores).mean())
+        return objective, {
+            "cosine_similarity": objective,
+            "unused_term": torch.zeros((), device=bundle.device, dtype=torch.float32),
+            "unused_term_2": torch.zeros((), device=bundle.device, dtype=torch.float32),
+        }
+
+    layers = [entry["layer"] for entry in steering_targets]
+    plus_states_by_layer = _last_token_hidden_by_layer_from_embeds(bundle, plus_prompt_embeds, layers)
+    minus_states_by_layer = _last_token_hidden_by_layer_from_embeds(bundle, minus_prompt_embeds, layers)
+    objective = torch.zeros((), device=bundle.device, dtype=torch.float32)
+    plus_projection = torch.zeros((), device=bundle.device, dtype=torch.float32)
+    minus_projection_negated = torch.zeros((), device=bundle.device, dtype=torch.float32)
+    cosine_similarity = torch.zeros((), device=bundle.device, dtype=torch.float32)
+
+    for entry in steering_targets:
+        layer = entry["layer"]
+        weight = float(entry["weight"])
+        vector = entry["vector"].to(bundle.device)
+        plus_state = plus_states_by_layer[layer]
+        minus_state = minus_states_by_layer[layer]
+        weighted_objective = weight * _pair_objective(
+            steering_vector=vector.to(plus_state.dtype),
+            plus_state=plus_state,
+            minus_state=minus_state,
+            objective_type=objective_type,
+        ).float()
+        objective = objective + weighted_objective
+        if objective_type == "cosine":
+            cosine_similarity = cosine_similarity + weighted_objective
+        typed_vector_f32 = vector.to(device=plus_state.device, dtype=torch.float32)
+        plus_projection = plus_projection + (weight * torch.dot(typed_vector_f32, plus_state.float()))
+        minus_projection_negated = minus_projection_negated + (weight * -torch.dot(typed_vector_f32, minus_state.float()))
+
+    if objective_type == "cosine":
+        return objective, {
+            "cosine_similarity": cosine_similarity,
+            "unused_term": torch.zeros((), device=bundle.device, dtype=torch.float32),
+            "unused_term_2": torch.zeros((), device=bundle.device, dtype=torch.float32),
+        }
+    return objective, {
+        "plus_projection": plus_projection,
+        "minus_projection_negated": minus_projection_negated,
+        "unused_term": torch.zeros((), device=bundle.device, dtype=torch.float32),
+    }
+
+
+def _multi_layer_batched_prompt_objective_and_terms(
+    bundle: TextModelBundle,
+    plus_prompt_embeds: torch.Tensor,
+    minus_prompt_embeds: torch.Tensor,
+    steering_targets: list[dict],
+    objective_type: str,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    if objective_type == "cosine_current_last_token":
+        objectives = []
+        for batch_index in range(plus_prompt_embeds.shape[0]):
+            prompt_objective, _ = _multi_layer_prompt_objective_and_terms(
+                bundle=bundle,
+                plus_prompt_embeds=plus_prompt_embeds[batch_index : batch_index + 1],
+                minus_prompt_embeds=minus_prompt_embeds[batch_index : batch_index + 1],
+                steering_targets=steering_targets,
+                objective_type=objective_type,
+            )
+            objectives.append(prompt_objective.float())
+        objective = torch.stack(objectives)
+        return objective, {
+            "cosine_similarity": objective,
+            "unused_term": torch.zeros_like(objective, dtype=torch.float32),
+            "unused_term_2": torch.zeros_like(objective, dtype=torch.float32),
+        }
+
+    layers = [entry["layer"] for entry in steering_targets]
+    plus_states_by_layer = _last_token_hidden_by_layer_from_embeds_batched(bundle, plus_prompt_embeds, layers)
+    minus_states_by_layer = _last_token_hidden_by_layer_from_embeds_batched(bundle, minus_prompt_embeds, layers)
+    batch_size = plus_prompt_embeds.shape[0]
+    objective = torch.zeros(batch_size, device=bundle.device, dtype=torch.float32)
+    plus_projection = torch.zeros(batch_size, device=bundle.device, dtype=torch.float32)
+    minus_projection_negated = torch.zeros(batch_size, device=bundle.device, dtype=torch.float32)
+    cosine_similarity = torch.zeros(batch_size, device=bundle.device, dtype=torch.float32)
+
+    for entry in steering_targets:
+        layer = entry["layer"]
+        weight = float(entry["weight"])
+        vector = entry["vector"].to(bundle.device)
+        plus_states = plus_states_by_layer[layer]
+        minus_states = minus_states_by_layer[layer]
+        weighted_objective = weight * _batched_pair_objective(
+            steering_vector=vector.to(plus_states.dtype),
+            plus_states=plus_states,
+            minus_states=minus_states,
+            objective_type=objective_type,
+        ).float()
+        objective = objective + weighted_objective
+        if objective_type == "cosine":
+            cosine_similarity = cosine_similarity + weighted_objective
+        typed_vector_f32 = vector.to(device=plus_states.device, dtype=torch.float32)
+        plus_projection = plus_projection + (weight * torch.matmul(plus_states.float(), typed_vector_f32))
+        minus_projection_negated = minus_projection_negated + (weight * -torch.matmul(minus_states.float(), typed_vector_f32))
+
+    if objective_type == "cosine":
+        return objective, {
+            "cosine_similarity": cosine_similarity,
+            "unused_term": torch.zeros_like(objective, dtype=torch.float32),
+            "unused_term_2": torch.zeros_like(objective, dtype=torch.float32),
+        }
+    return objective, {
+        "plus_projection": plus_projection,
+        "minus_projection_negated": minus_projection_negated,
+        "unused_term": torch.zeros_like(objective, dtype=torch.float32),
+    }
 
 
 def _single_prompt_objective_and_terms(
@@ -1018,6 +1403,30 @@ def _single_prompt_objective_and_terms(
             batched=False,
             last_prompt_token_steering=last_prompt_token_steering,
         )
+    if objective_type == "cosine_current_last_token":
+        plus_states = _current_last_token_hidden_sequence_from_embeds(
+            bundle=bundle,
+            prompt_embeds=plus_prompt_embeds,
+            layer=layer,
+            num_steps=CURRENT_LAST_TOKEN_STEPS,
+        )
+        minus_states = _current_last_token_hidden_sequence_from_embeds(
+            bundle=bundle,
+            prompt_embeds=minus_prompt_embeds,
+            layer=layer,
+            num_steps=CURRENT_LAST_TOKEN_STEPS,
+        )
+        typed_steering_vector = steering_vector.to(device=plus_states[0].device, dtype=torch.float32).unsqueeze(0)
+        step_scores = []
+        for plus_state, minus_state in zip(plus_states, minus_states):
+            difference = (plus_state - minus_state).float()
+            step_scores.append(F.cosine_similarity(difference, typed_steering_vector, dim=-1)[0])
+        objective = torch.stack(step_scores).mean()
+        return objective, {
+            "cosine_similarity": objective.float(),
+            "unused_term": torch.zeros((), device=objective.device, dtype=torch.float32),
+            "unused_term_2": torch.zeros((), device=objective.device, dtype=torch.float32),
+        }
 
     plus_state = _last_token_hidden_from_embeds(bundle=bundle, prompt_embeds=plus_prompt_embeds, layer=layer)
     minus_state = _last_token_hidden_from_embeds(bundle=bundle, prompt_embeds=minus_prompt_embeds, layer=layer)
@@ -1029,6 +1438,12 @@ def _single_prompt_objective_and_terms(
         minus_state=minus_state,
         objective_type=objective_type,
     )
+    if objective_type == "cosine":
+        return objective, {
+            "cosine_similarity": objective.float(),
+            "unused_term": torch.zeros((), device=plus_state.device, dtype=torch.float32),
+            "unused_term_2": torch.zeros((), device=plus_state.device, dtype=torch.float32),
+        }
     return objective, {
         "plus_projection": torch.dot(typed_steering_vector_f32, plus_state.float()),
         "minus_projection_negated": -torch.dot(typed_steering_vector_f32, minus_state.float()),
@@ -1061,6 +1476,28 @@ def _batched_prompt_objective_and_terms(
             batched=True,
             last_prompt_token_steering=last_prompt_token_steering,
         )
+    if objective_type == "cosine_current_last_token":
+        batch_scores = []
+        for batch_index in range(plus_prompt_embeds.shape[0]):
+            prompt_objective, _ = _single_prompt_objective_and_terms(
+                bundle=bundle,
+                plus_prompt_embeds=plus_prompt_embeds[batch_index : batch_index + 1],
+                minus_prompt_embeds=minus_prompt_embeds[batch_index : batch_index + 1],
+                steering_vector=steering_vector,
+                layer=layer,
+                objective_type=objective_type,
+                target_ids=target_ids,
+                neutral_prompt_embeds=neutral_prompt_embeds,
+                steering_scale=steering_scale,
+                last_prompt_token_steering=last_prompt_token_steering,
+            )
+            batch_scores.append(prompt_objective.float())
+        objective = torch.stack(batch_scores)
+        return objective, {
+            "cosine_similarity": objective.float(),
+            "unused_term": torch.zeros_like(objective, dtype=torch.float32),
+            "unused_term_2": torch.zeros_like(objective, dtype=torch.float32),
+        }
 
     plus_states = _last_token_hidden_from_embeds_batched(bundle=bundle, prompt_embeds=plus_prompt_embeds, layer=layer)
     minus_states = _last_token_hidden_from_embeds_batched(bundle=bundle, prompt_embeds=minus_prompt_embeds, layer=layer)
@@ -1072,6 +1509,12 @@ def _batched_prompt_objective_and_terms(
         minus_states=minus_states,
         objective_type=objective_type,
     )
+    if objective_type == "cosine":
+        return objective, {
+            "cosine_similarity": objective.float(),
+            "unused_term": torch.zeros_like(objective, dtype=torch.float32),
+            "unused_term_2": torch.zeros_like(objective, dtype=torch.float32),
+        }
     return objective, {
         "plus_projection": torch.matmul(plus_states.float(), typed_steering_vector_f32),
         "minus_projection_negated": -torch.matmul(minus_states.float(), typed_steering_vector_f32),
@@ -1085,6 +1528,12 @@ def _empty_term_totals(objective_type: str) -> dict[str, float]:
             "neutral_prompt_positive_steering_negative_target_ce": 0.0,
             "neutral_prompt_negative_steering_positive_target_ce": 0.0,
             "unused_term": 0.0,
+        }
+    if objective_type in {"cosine", "cosine_current_last_token"}:
+        return {
+            "cosine_similarity": 0.0,
+            "unused_term": 0.0,
+            "unused_term_2": 0.0,
         }
     return {
         "plus_projection": 0.0,
@@ -1102,6 +1551,15 @@ def _term_totals_to_breakdown(objective_type: str, totals: dict[str, float]) -> 
             "term_2": totals["neutral_prompt_negative_steering_positive_target_ce"],
             "term_3_name": "unused_term",
             "term_3": totals["unused_term"],
+        }
+    if objective_type in {"cosine", "cosine_current_last_token"}:
+        return {
+            "term_1_name": "cosine_similarity",
+            "term_1": totals["cosine_similarity"],
+            "term_2_name": "unused_term",
+            "term_2": totals["unused_term"],
+            "term_3_name": "unused_term_2",
+            "term_3": totals["unused_term_2"],
         }
     return {
         "term_1_name": "plus_projection",
@@ -1263,6 +1721,74 @@ def _last_token_hidden_from_embeds_batched(
     return outputs.hidden_states[layer + 1][:, prompt_embeds.shape[1] - 1, :]
 
 
+def _current_last_token_hidden_sequence_from_embeds(
+    bundle: TextModelBundle,
+    prompt_embeds: torch.Tensor,
+    layer: int,
+    num_steps: int,
+) -> list[torch.Tensor]:
+    embedding_layer = bundle.model.get_input_embeddings()
+    current_embeds = prompt_embeds
+    current_attention_mask = torch.ones(current_embeds.shape[:2], dtype=torch.long, device=bundle.device)
+    hidden_sequence: list[torch.Tensor] = []
+
+    for _ in range(max(1, num_steps)):
+        outputs = bundle.model(
+            inputs_embeds=current_embeds,
+            attention_mask=current_attention_mask,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+        hidden_sequence.append(outputs.hidden_states[layer + 1][:, current_embeds.shape[1] - 1, :])
+        with torch.no_grad():
+            next_token_ids = torch.argmax(outputs.logits[:, current_embeds.shape[1] - 1, :], dim=-1)
+            next_token_embeds = embedding_layer(next_token_ids).unsqueeze(1)
+            current_embeds = torch.cat([current_embeds, next_token_embeds], dim=1)
+            current_attention_mask = torch.cat(
+                [
+                    current_attention_mask,
+                    torch.ones((current_attention_mask.shape[0], 1), dtype=current_attention_mask.dtype, device=bundle.device),
+                ],
+                dim=1,
+            )
+    return hidden_sequence
+
+
+def _current_last_token_hidden_by_layer_sequence_from_embeds(
+    bundle: TextModelBundle,
+    prompt_embeds: torch.Tensor,
+    layers: list[int],
+    num_steps: int,
+) -> dict[int, list[torch.Tensor]]:
+    embedding_layer = bundle.model.get_input_embeddings()
+    current_embeds = prompt_embeds
+    current_attention_mask = torch.ones(current_embeds.shape[:2], dtype=torch.long, device=bundle.device)
+    hidden_by_layer: dict[int, list[torch.Tensor]] = {layer: [] for layer in layers}
+
+    for _ in range(max(1, num_steps)):
+        outputs = bundle.model(
+            inputs_embeds=current_embeds,
+            attention_mask=current_attention_mask,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+        last_index = current_embeds.shape[1] - 1
+        for layer in layers:
+            hidden_by_layer[layer].append(outputs.hidden_states[layer + 1][:, last_index, :])
+        with torch.no_grad():
+            next_token_ids = torch.argmax(outputs.logits[:, last_index, :], dim=-1)
+            next_token_embeds = embedding_layer(next_token_ids).unsqueeze(1)
+            current_embeds = torch.cat([current_embeds, next_token_embeds], dim=1)
+            current_attention_mask = torch.cat(
+                [
+                    current_attention_mask,
+                    torch.ones((current_attention_mask.shape[0], 1), dtype=current_attention_mask.dtype, device=bundle.device),
+                ],
+                dim=1,
+            )
+    return hidden_by_layer
+
+
 def _next_token_logits_from_embeds(
     bundle: TextModelBundle,
     prompt_embeds: torch.Tensor,
@@ -1314,6 +1840,57 @@ def load_targets_json(path: str) -> dict[str, str]:
     }
 
 
+def load_steering_targets_from_config(path: str, default_steering_file: str) -> list[dict]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(payload, dict):
+        entries = payload.get("entries") or payload.get("layers") or payload.get("steering") or []
+    elif isinstance(payload, list):
+        entries = payload
+    else:
+        raise ValueError("steering-config must be a JSON list or dict containing an entries/layers/steering list.")
+    if not entries:
+        raise ValueError(f"No steering entries found in {path}")
+
+    raw_entries = []
+    for index, row in enumerate(entries):
+        if not isinstance(row, dict):
+            raise ValueError(f"steering-config entry {index} must be an object.")
+        if "layer" not in row:
+            raise ValueError(f"steering-config entry {index} is missing 'layer'.")
+        scale = row.get("scale", row.get("coefficient", row.get("weight")))
+        if scale is None:
+            raise ValueError(f"steering-config entry {index} must provide scale/coefficient/weight.")
+        steering_file = row.get("steering_file") or row.get("path") or default_steering_file
+        raw_entries.append(
+            {
+                "layer": int(row["layer"]),
+                "scale": float(scale),
+                "steering_file": steering_file,
+            }
+        )
+
+    total_abs_scale = sum(abs(entry["scale"]) for entry in raw_entries)
+    if total_abs_scale <= 0.0:
+        raise ValueError("steering-config scales must not all be zero.")
+    num_entries = len(raw_entries)
+    steering_targets = []
+    for entry in raw_entries:
+        signed_vector = load_steering_vector(entry["steering_file"], entry["layer"]).float()
+        if entry["scale"] < 0:
+            signed_vector = -signed_vector
+        weight = num_entries * abs(entry["scale"]) / total_abs_scale
+        steering_targets.append(
+            {
+                "layer": entry["layer"],
+                "scale": entry["scale"],
+                "weight": weight,
+                "steering_file": entry["steering_file"],
+                "vector": signed_vector,
+            }
+        )
+    return steering_targets
+
+
 def _default_fill_token_id(tokenizer) -> int:
     for token in [" and", " the", ".", ","]:
         token_ids = tokenizer.encode(token, add_special_tokens=False)
@@ -1349,6 +1926,11 @@ def _initialize_suffix_token_ids(
 
 def main():
     args = parse_args()
+    global CURRENT_LAST_TOKEN_STEPS
+    CURRENT_LAST_TOKEN_STEPS = max(1, int(args.current_last_token_steps))
+    if args.all_tokens_steer and args.last_prompt_token_steering:
+        raise ValueError("Use at most one of --all-tokens-steer or --last-prompt-token-steering.")
+    effective_last_prompt_token_steering = not args.all_tokens_steer
     resume_payload = load_resume_artifact(args.resume_from) if args.resume_from else None
     targets_from_json = load_targets_json(args.targets_json) if args.targets_json else None
     positive_target = targets_from_json["positive_target"] if targets_from_json is not None else args.positive_target
@@ -1356,6 +1938,9 @@ def main():
     negative_target = targets_from_json["negative_target"] if targets_from_json is not None else args.negative_target
     bundle = load_text_model_bundle(args.model, dtype=args.dtype, device_map=args.device_map)
     steering_vector = load_steering_vector(args.steering_file, args.layer)
+    steering_targets = load_steering_targets_from_config(args.steering_config, args.steering_file) if args.steering_config else None
+    if steering_targets is not None and args.objective_type == "steered_ce":
+        raise ValueError("--steering-config is currently supported only for dot and cosine objectives.")
     if args.objective_type == "steered_ce":
         prompt_pairs = load_prompt_pairs(
             prompt_pairs_file=args.prompt_pairs_file,
@@ -1378,6 +1963,7 @@ def main():
         prompt_pairs=prompt_pairs,
         steering_vector=steering_vector,
         layer=args.layer,
+        steering_targets=steering_targets,
         suffix_length=args.suffix_length,
         steps=args.steps,
         top_k=args.top_k,
@@ -1391,7 +1977,7 @@ def main():
         positive_target=positive_target,
         negative_target=negative_target,
         steering_scale=args.steering_scale,
-        last_prompt_token_steering=args.last_prompt_token_steering,
+        last_prompt_token_steering=effective_last_prompt_token_steering,
         initial_suffix_token_ids=None if resume_payload is None else torch.tensor(resume_payload["suffix_token_ids"], dtype=torch.long),
         existing_trace=None if resume_payload is None else resume_payload.get("trace", []),
         existing_best_objective=None if resume_payload is None else resume_payload.get("objective"),
@@ -1407,8 +1993,20 @@ def main():
         "positive_target": positive_target,
         "negative_target": negative_target,
         "targets_json": args.targets_json,
+        "steering_config": args.steering_config,
+        "steering_targets": None if steering_targets is None else [
+            {
+                "layer": entry["layer"],
+                "scale": entry["scale"],
+                "weight": entry["weight"],
+                "steering_file": entry["steering_file"],
+            }
+            for entry in steering_targets
+        ],
         "steering_scale": args.steering_scale,
-        "last_prompt_token_steering": args.last_prompt_token_steering,
+        "current_last_token_steps": CURRENT_LAST_TOKEN_STEPS,
+        "all_tokens_steer": args.all_tokens_steer,
+        "last_prompt_token_steering": effective_last_prompt_token_steering,
         "suffix_token_ids": result.suffix_token_ids,
         "suffix_text": result.suffix_text,
         "objective": result.objective,

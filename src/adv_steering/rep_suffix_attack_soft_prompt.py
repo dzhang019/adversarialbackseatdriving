@@ -37,6 +37,8 @@ def parse_args():
     parser.add_argument("--positive-target", default="")
     parser.add_argument("--negative-target", default="")
     parser.add_argument("--steering-scale", type=float, default=8.0)
+    parser.add_argument("--all-tokens-steer", action="store_true", help="For steered_ce, steer all prompt+target token positions instead of only the final prompt token.")
+    parser.add_argument("--last-prompt-token-steering", action="store_true", help="For steered_ce, steer only the final prompt token. This is the default behavior.")
     parser.add_argument("--suffix-length", type=int, default=200)
     parser.add_argument("--inner-steps", type=int, default=20, help="Number of optimization steps for the soft prompt matrix.")
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -49,6 +51,9 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.all_tokens_steer and args.last_prompt_token_steering:
+        raise ValueError("Use at most one of --all-tokens-steer or --last-prompt-token-steering.")
+    effective_last_prompt_token_steering = not args.all_tokens_steer
     bundle = load_text_model_bundle(args.model, dtype=args.dtype, device_map=args.device_map)
     steering_vector = load_steering_vector(args.steering_file, args.layer).to(bundle.device)
     prompt_pairs = load_prompt_pairs(
@@ -98,6 +103,7 @@ def main():
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         save_all_steps=args.save_all_steps,
+        last_prompt_token_steering=effective_last_prompt_token_steering,
     )
 
     payload = {
@@ -110,6 +116,8 @@ def main():
         "negative_target": args.negative_target,
         "suffix_length": args.suffix_length,
         "init_mode": args.init_mode,
+        "all_tokens_steer": args.all_tokens_steer,
+        "last_prompt_token_steering": effective_last_prompt_token_steering,
         "inner_steps": args.inner_steps,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
@@ -170,6 +178,7 @@ def optimize_soft_prompt(
     learning_rate: float,
     weight_decay: float,
     save_all_steps: bool,
+    last_prompt_token_steering: bool,
 ):
     embedding_layer = bundle.model.get_input_embeddings()
     soft_prompt_parameter = torch.nn.Parameter(soft_prompt.detach().clone().float())
@@ -197,6 +206,7 @@ def optimize_soft_prompt(
                 target_ids=target_ids,
                 neutral_prompt_embeds=neutral_prompt_embeds,
                 steering_scale=steering_scale,
+                last_prompt_token_steering=last_prompt_token_steering,
             )
             objective = objective + prompt_objective.float()
             if totals is None:

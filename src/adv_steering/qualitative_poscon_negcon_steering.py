@@ -36,8 +36,9 @@ def parse_args():
     parser.add_argument("--dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"])
     parser.add_argument("--device-map", default="auto", help="Transformers device_map value.")
     parser.add_argument("--max-new-tokens", type=int, default=64, help="Maximum number of new tokens.")
-    parser.add_argument("--all-tokens-steer", action="store_true", help="Apply steering to all token positions in each forward pass. By default, generation only steers the current last token.")
-    parser.add_argument("--last-prompt-token-steering", action="store_true", help="Apply steering only once, on the final prompt token that predicts the first generated token.")
+    parser.add_argument("--all-tokens-steer", action="store_true", help="Apply steering to all token positions in each forward pass.")
+    parser.add_argument("--last-prompt-token-steering", action="store_true", help="Apply steering only once, on the final prompt token that predicts the first generated token. This is the default behavior.")
+    parser.add_argument("--current-last-token-steering", action="store_true", help="Apply steering to the current last token on every generation step.")
     parser.add_argument("--show-top-logits", action="store_true", help="Print the top next-token logits at each generation step.")
     parser.add_argument("--top-logits-k", type=int, default=10, help="How many logits to print per generation step when --show-top-logits is enabled.")
     parser.add_argument("--response-targets", default="", help="Optional JSON file with fixed positive/neutral/negative responses for teacher-forced CE scoring.")
@@ -52,8 +53,19 @@ def main():
     output_path = resolve_output_path(args.output, args.steering_file)
     if args.suffix and args.soft_prompt:
         raise ValueError("Use at most one of --suffix or --soft-prompt.")
-    if args.all_tokens_steer and args.last_prompt_token_steering:
-        raise ValueError("Use at most one of --all-tokens-steer or --last-prompt-token-steering.")
+    steering_mode_count = int(args.all_tokens_steer) + int(args.last_prompt_token_steering) + int(args.current_last_token_steering)
+    if steering_mode_count > 1:
+        raise ValueError(
+            "Use at most one of --all-tokens-steer, --last-prompt-token-steering, or --current-last-token-steering."
+        )
+    if steering_mode_count == 0:
+        args.last_prompt_token_steering = True
+    if args.all_tokens_steer:
+        steering_mode = "all_tokens"
+    elif args.last_prompt_token_steering:
+        steering_mode = "last_prompt_token"
+    else:
+        steering_mode = "current_last_token"
     suffix_path = resolve_suffix_path(args.suffix, output_path.parent if output_path else None) if args.suffix else ""
     suffix_info = load_suffix_artifact(suffix_path, args.step, args.exact_suffix_ids) if suffix_path else {"suffix_text": "", "suffix_token_ids": None}
     soft_prompt_path = resolve_suffix_path(args.soft_prompt, output_path.parent if output_path else None) if args.soft_prompt else ""
@@ -84,8 +96,10 @@ def main():
         "dtype": args.dtype,
         "device_map": args.device_map,
         "max_new_tokens": args.max_new_tokens,
+        "steering_mode": steering_mode,
         "all_tokens_steer": args.all_tokens_steer,
         "last_prompt_token_steering": args.last_prompt_token_steering,
+        "current_last_token_steering": args.current_last_token_steering,
         "show_top_logits": args.show_top_logits,
         "top_logits_k": args.top_logits_k,
         "response_targets_path": args.response_targets,
@@ -105,6 +119,7 @@ def main():
     }
 
     results = []
+    print(f"Resolved steering mode: {steering_mode}", flush=True)
     for index, prompt in enumerate(prompts, start=1):
         full_prompt = prompt if (args.exact_suffix_ids or soft_prompt_matrix is not None) else append_suffix(prompt, suffix_text)
         print(f"[{index}/{len(prompts)}] Prompt: {prompt}", flush=True)
@@ -231,7 +246,13 @@ def main():
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(json.dumps({"metadata": metadata, "results": results}, indent=2), encoding="utf-8")
 
-    print_results(results, args.layer, args.poscon_scale, args.negcon_scale)
+    print_results(
+        results,
+        args.layer,
+        args.poscon_scale,
+        args.negcon_scale,
+        steering_entries=metadata.get("steering_entries"),
+    )
     if output_path:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps({"metadata": metadata, "results": results}, indent=2), encoding="utf-8")
@@ -1072,10 +1093,29 @@ def _combined_steering_context(
     return multi_hook(contexts)
 
 
-def print_results(results: list[dict], layer: int, poscon_scale: float, negcon_scale: float) -> None:
-    print(f"Layer {layer} qualitative steering test")
-    print(f"Positive concept scale: {poscon_scale}")
-    print(f"Negative concept scale: {negcon_scale}")
+def print_results(
+    results: list[dict],
+    layer: int,
+    poscon_scale: float,
+    negcon_scale: float,
+    steering_entries: list[dict] | None = None,
+) -> None:
+    if steering_entries:
+        print("Multi-layer qualitative steering test")
+        print("Positive concept steering entries:")
+        for entry in steering_entries:
+            print(
+                f"  layer={entry['layer']} scale={entry['scale']} steering_file={entry['steering_file']}",
+            )
+        print("Negative concept steering entries:")
+        for entry in steering_entries:
+            print(
+                f"  layer={entry['layer']} scale={-entry['scale']} steering_file={entry['steering_file']}",
+            )
+    else:
+        print(f"Layer {layer} qualitative steering test")
+        print(f"Positive concept scale: {poscon_scale}")
+        print(f"Negative concept scale: {negcon_scale}")
     print("")
     for index, row in enumerate(results, start=1):
         print(f"[{index}] Prompt: {row['prompt']}")
