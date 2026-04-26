@@ -13,30 +13,22 @@ import torch.nn.functional as F
 if __package__ in (None, ""):
     sys.path.append(str(Path(__file__).resolve().parents[1]))
     from adv_steering.rep_suffix_attack_largo import (
-        build_prompt_embeds_with_tokseq,
         build_summary_prompt_variants,
-        build_input_ids_with_tokseq_ids,
-        generate_with_exact_tokseq_ids,
         initialize_tokseq_embeds,
-        prepare_prompt_segments,
         summarize_tokseq_matrix,
         tokseq_embeds_from_summary_token_ids,
         truncate_tokseq_token_ids,
     )
-    from adv_steering.text_backend import encode_chat_prompt, load_text_model_bundle
+    from adv_steering.text_backend import encode_chat_prompt, load_text_model_bundle, split_chat_prompt_for_user_suffix
 else:
     from .rep_suffix_attack_largo import (
-        build_prompt_embeds_with_tokseq,
         build_summary_prompt_variants,
-        build_input_ids_with_tokseq_ids,
-        generate_with_exact_tokseq_ids,
         initialize_tokseq_embeds,
-        prepare_prompt_segments,
         summarize_tokseq_matrix,
         tokseq_embeds_from_summary_token_ids,
         truncate_tokseq_token_ids,
     )
-    from .text_backend import encode_chat_prompt, load_text_model_bundle
+    from .text_backend import encode_chat_prompt, load_text_model_bundle, split_chat_prompt_for_user_suffix
 
 
 DEFAULT_COACH_PROMPT = (
@@ -103,6 +95,7 @@ def main():
     dataset_path.parent.mkdir(parents=True, exist_ok=True)
     dataset_payload = {
         "model": args.model,
+        "seed": args.seed,
         "full_prompt": full_prompt,
         "base_prompt": base_prompt,
         "samples": len(dataset),
@@ -251,6 +244,88 @@ def build_full_prompt(coach_prompt: str, question: str) -> str:
 
 def build_base_prompt(question: str) -> str:
     return f"Question: {question.strip()}"
+
+
+def prepare_prompt_segments(bundle, prompt: str, tokseq_position: str) -> dict[str, torch.Tensor | str]:
+    if tokseq_position == "suffix":
+        segments = split_chat_prompt_for_user_suffix(bundle, prompt)
+        return {
+            "tokseq_position": tokseq_position,
+            "user_input_ids": segments["user_input_ids"],
+            "assistant_prefix_ids": segments["assistant_prefix_ids"],
+        }
+    if tokseq_position != "prefix":
+        raise ValueError(f"Unsupported tokseq position: {tokseq_position}")
+
+    prompt_without_generation = encode_chat_prompt(bundle, prompt, add_generation_prompt=False)
+    prompt_with_generation = encode_chat_prompt(bundle, prompt, add_generation_prompt=True)
+    user_turn_ids = prompt_without_generation["input_ids"][0]
+    full_ids = prompt_with_generation["input_ids"][0]
+    user_turn_length = user_turn_ids.shape[0]
+    if full_ids.shape[0] < user_turn_length or not torch.equal(full_ids[:user_turn_length], user_turn_ids):
+        raise ValueError(
+            "Could not split the chat template into user turn and assistant generation prefix. "
+            "This tokenizer's generation prompt is not a simple token suffix."
+        )
+
+    prompt_content_ids = bundle.tokenizer.encode(prompt, add_special_tokens=False)
+    content_start = find_token_subsequence(user_turn_ids.tolist(), prompt_content_ids)
+    if content_start is None:
+        raise ValueError("Could not locate the base prompt text inside the chat-template tokens.")
+
+    return {
+        "tokseq_position": tokseq_position,
+        "user_prefix_ids": user_turn_ids[:content_start].unsqueeze(0),
+        "user_content_and_suffix_ids": user_turn_ids[content_start:].unsqueeze(0),
+        "assistant_prefix_ids": full_ids[user_turn_length:].unsqueeze(0),
+    }
+
+
+def find_token_subsequence(haystack: list[int], needle: list[int]) -> int | None:
+    if not needle:
+        return 0
+    last_start = len(haystack) - len(needle)
+    for start in range(last_start + 1):
+        if haystack[start : start + len(needle)] == needle:
+            return start
+    return None
+
+
+def build_prompt_embeds_with_tokseq(bundle, prompt_segments: dict[str, torch.Tensor | str], tokseq_embeds: torch.Tensor) -> torch.Tensor:
+    embedding_layer = bundle.model.get_input_embeddings()
+    if prompt_segments["tokseq_position"] == "prefix":
+        user_prefix_embeds = embedding_layer(prompt_segments["user_prefix_ids"]).detach()
+        user_content_embeds = embedding_layer(prompt_segments["user_content_and_suffix_ids"]).detach()
+        assistant_prefix_embeds = embedding_layer(prompt_segments["assistant_prefix_ids"]).detach()
+        return torch.cat([user_prefix_embeds, tokseq_embeds, user_content_embeds, assistant_prefix_embeds], dim=1)
+
+    user_embeds = embedding_layer(prompt_segments["user_input_ids"]).detach()
+    assistant_prefix_embeds = embedding_layer(prompt_segments["assistant_prefix_ids"]).detach()
+    return torch.cat([user_embeds, tokseq_embeds, assistant_prefix_embeds], dim=1)
+
+
+def build_input_ids_with_tokseq_ids(bundle, prompt: str, tokseq_token_ids: torch.Tensor, tokseq_position: str) -> torch.Tensor:
+    prompt_segments = prepare_prompt_segments(bundle, prompt, tokseq_position)
+    tokseq_ids = tokseq_token_ids.to(bundle.device)
+    if tokseq_position == "prefix":
+        return torch.cat(
+            [
+                prompt_segments["user_prefix_ids"][0],
+                tokseq_ids,
+                prompt_segments["user_content_and_suffix_ids"][0],
+                prompt_segments["assistant_prefix_ids"][0],
+            ],
+            dim=0,
+        ).unsqueeze(0)
+
+    return torch.cat(
+        [
+            prompt_segments["user_input_ids"][0],
+            tokseq_ids,
+            prompt_segments["assistant_prefix_ids"][0],
+        ],
+        dim=0,
+    ).unsqueeze(0)
 
 
 @torch.no_grad()

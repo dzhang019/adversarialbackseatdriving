@@ -540,13 +540,20 @@ def summarize_tokseq_matrix(
     embedding_layer = bundle.model.get_input_embeddings()
     if not torch.isfinite(tokseq_embeds).all():
         raise ValueError("Cannot summarize tokseq matrix because it contains non-finite values.")
-    prefix_embeds, wrapper_embeds = build_interpretation_wrapper_embeds(
+    user_prefix_embeds, user_suffix_and_assistant_embeds = build_interpretation_wrapper_embeds(
         bundle=bundle,
         model_name=model_name,
         summary_prompt=summary_prompt,
         assistant_prefill=assistant_prefill,
     )
-    full_embeds = torch.cat([prefix_embeds, tokseq_embeds.to(prefix_embeds.dtype), wrapper_embeds], dim=1)
+    full_embeds = torch.cat(
+        [
+            user_prefix_embeds,
+            tokseq_embeds.to(user_prefix_embeds.dtype),
+            user_suffix_and_assistant_embeds,
+        ],
+        dim=1,
+    )
     attention_mask = torch.ones(full_embeds.shape[:2], dtype=torch.long, device=bundle.device)
     generated_token_ids: list[int] = []
     current_embeds = full_embeds
@@ -587,12 +594,53 @@ def build_interpretation_wrapper_embeds(
         suffix_ids = bundle.tokenizer.encode(suffix_text, add_special_tokens=False, return_tensors="pt").to(bundle.device)
         return embedding_layer(prefix_ids), embedding_layer(suffix_ids)
 
-    user_prompt = f"{summary_prompt}"
-    prefix_ids = encode_chat_prompt(bundle, user_prompt, add_generation_prompt=True)["input_ids"][0]
+    prompt_without_generation = encode_chat_prompt(bundle, summary_prompt, add_generation_prompt=False)
+    prompt_with_generation = encode_chat_prompt(bundle, summary_prompt, add_generation_prompt=True)
+    user_turn_ids = prompt_without_generation["input_ids"][0]
+    full_ids = prompt_with_generation["input_ids"][0]
+    user_turn_length = user_turn_ids.shape[0]
+    if full_ids.shape[0] < user_turn_length or not torch.equal(full_ids[:user_turn_length], user_turn_ids):
+        raise ValueError(
+            "Could not split the summary chat template into user turn and assistant generation prefix. "
+            "This tokenizer's generation prompt is not a simple token suffix."
+        )
+
     assistant_prefill_ids = bundle.tokenizer.encode(assistant_prefill, add_special_tokens=False, return_tensors="pt").to(bundle.device)
-    prefix_embeds = embedding_layer(prefix_ids.unsqueeze(0))
-    assistant_prefill_embeds = embedding_layer(assistant_prefill_ids)
-    return prefix_embeds, assistant_prefill_embeds
+    insertion_index = find_user_content_append_index(bundle, summary_prompt, user_turn_ids)
+    user_prefix_ids = user_turn_ids[:insertion_index].unsqueeze(0)
+    user_suffix_and_assistant_ids = torch.cat(
+        [
+            user_turn_ids[insertion_index:],
+            full_ids[user_turn_length:],
+            assistant_prefill_ids[0],
+        ],
+        dim=0,
+    ).unsqueeze(0)
+    return embedding_layer(user_prefix_ids), embedding_layer(user_suffix_and_assistant_ids)
+
+
+def find_user_content_append_index(bundle, prompt: str, user_turn_ids: torch.Tensor) -> int:
+    sentinel = "<LARGO_TOKSEQ_CONTENT_BOUNDARY_6b7f5c5a>"
+    extended_user_turn_ids = encode_chat_prompt(bundle, prompt + sentinel, add_generation_prompt=False)["input_ids"][0]
+    base_tokens = user_turn_ids.tolist()
+    extended_tokens = extended_user_turn_ids.tolist()
+
+    prefix_length = 0
+    max_prefix_length = min(len(base_tokens), len(extended_tokens))
+    while prefix_length < max_prefix_length and base_tokens[prefix_length] == extended_tokens[prefix_length]:
+        prefix_length += 1
+
+    base_end = len(base_tokens)
+    extended_end = len(extended_tokens)
+    while (
+        base_end > prefix_length
+        and extended_end > prefix_length
+        and base_tokens[base_end - 1] == extended_tokens[extended_end - 1]
+    ):
+        base_end -= 1
+        extended_end -= 1
+
+    return base_end
 
 
 def truncate_tokseq_token_ids(bundle, summary_token_ids: list[int], tokseq_length: int) -> torch.Tensor:

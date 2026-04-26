@@ -69,6 +69,18 @@ def collect_last_token_residuals(bundle, backend: str, prompt: str, response: st
     return text_backend.collect_last_token_residuals(bundle, prompt, response)
 
 
+def collect_user_story_last_token_residuals(bundle, backend: str, story: str):
+    if backend == "qwen_vl":
+        return qwen_vl.collect_user_story_last_token_residuals(bundle, story)
+    return text_backend.collect_user_story_last_token_residuals(bundle, story)
+
+
+def collect_user_story_mean_residuals(bundle, backend: str, story: str):
+    if backend == "qwen_vl":
+        return qwen_vl.collect_user_story_mean_residuals(bundle, story)
+    return text_backend.collect_user_story_mean_residuals(bundle, story)
+
+
 def load_concepts(path: str | Path) -> list[str]:
     return qwen_vl.load_concepts(path)
 

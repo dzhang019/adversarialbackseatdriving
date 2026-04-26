@@ -14,9 +14,9 @@ from tqdm import tqdm
 
 if __package__ in (None, ""):
     sys.path.append(str(Path(__file__).resolve().parents[1]))
-    from adv_steering.backend import collect_last_token_residuals, load_bundle, read_jsonl
+    from adv_steering.backend import collect_last_token_residuals, collect_user_story_last_token_residuals, collect_user_story_mean_residuals, load_bundle, read_jsonl
 else:
-    from .backend import collect_last_token_residuals, load_bundle, read_jsonl
+    from .backend import collect_last_token_residuals, collect_user_story_last_token_residuals, collect_user_story_mean_residuals, load_bundle, read_jsonl
 
 
 def parse_args():
@@ -29,6 +29,16 @@ def parse_args():
     parser.add_argument("--device-map", default="auto", help="Transformers device_map value.")
     parser.add_argument("--output-dir", default="runs", help="Directory for analysis outputs.")
     parser.add_argument("--top-k", type=int, default=8, help="How many top layers to highlight in the summary.")
+    parser.add_argument(
+        "--residual-mode",
+        default="generation_prompt",
+        choices=["generation_prompt", "story_only", "story_mean"],
+        help=(
+            "Where to collect residuals: generation_prompt uses the assistant-generation boundary from the old pipeline; "
+            "story_only puts only the story in a user message and reads the final story token; "
+            "story_mean mean-pools over story tokens in that same story-only user message."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -41,12 +51,16 @@ def analyze_poscon_negcon_residuals(
     device_map: str = "auto",
     output_dir: str = "runs",
     top_k: int = 8,
+    residual_mode: str = "generation_prompt",
 ) -> dict[str, Any]:
+    if residual_mode not in {"generation_prompt", "story_only", "story_mean"}:
+        raise ValueError(f"Unsupported residual mode: {residual_mode}")
     if residual_file:
         residual_path = Path(residual_file)
         residual_payload = torch.load(residual_path, map_location="cpu")
         model = residual_payload.get("model", model)
         resolved_backend = residual_payload.get("backend", backend)
+        residual_mode = residual_payload.get("residual_mode", residual_mode)
         concepts = residual_payload.get("concepts", [])
         poscon_tensor = residual_payload["poscon_residuals"].float()
         negcon_tensor = residual_payload["negcon_residuals"].float()
@@ -61,6 +75,9 @@ def analyze_poscon_negcon_residuals(
         else:
             steering_vectors = steering_vectors.float()
         rows = read_jsonl(dataset) if dataset and Path(dataset).exists() else []
+        residual_labels = residual_payload.get("residual_labels")
+        if residual_labels is None:
+            residual_labels = build_residual_labels(rows, concepts, residual_mode)
     else:
         rows = read_jsonl(dataset)
         if not rows:
@@ -78,12 +95,20 @@ def analyze_poscon_negcon_residuals(
             negcon_prompt = row.get("negcon_prompt") or row.get("negative_prompt") or row["lie_prompt"]
             negcon_response = row.get("negcon_response") or row.get("negative_response") or row["lie_response"]
 
-            poscon_stack = collect_last_token_residuals(bundle, resolved_backend, poscon_prompt, poscon_response)
-            negcon_stack = collect_last_token_residuals(bundle, resolved_backend, negcon_prompt, negcon_response)
+            if residual_mode == "story_only":
+                poscon_stack = collect_user_story_last_token_residuals(bundle, resolved_backend, poscon_response)
+                negcon_stack = collect_user_story_last_token_residuals(bundle, resolved_backend, negcon_response)
+            elif residual_mode == "story_mean":
+                poscon_stack = collect_user_story_mean_residuals(bundle, resolved_backend, poscon_response)
+                negcon_stack = collect_user_story_mean_residuals(bundle, resolved_backend, negcon_response)
+            else:
+                poscon_stack = collect_last_token_residuals(bundle, resolved_backend, poscon_prompt, poscon_response)
+                negcon_stack = collect_last_token_residuals(bundle, resolved_backend, negcon_prompt, negcon_response)
             poscon_residuals.append(poscon_stack)
             negcon_residuals.append(negcon_stack)
             concepts.append(row["concept"])
 
+        residual_labels = build_residual_labels(rows, concepts, residual_mode)
         poscon_tensor = torch.stack(poscon_residuals, dim=0)
         negcon_tensor = torch.stack(negcon_residuals, dim=0)
         difference_tensor = poscon_tensor - negcon_tensor
@@ -131,7 +156,9 @@ def analyze_poscon_negcon_residuals(
                 {
                     "model": model,
                     "backend": resolved_backend,
+                    "residual_mode": residual_mode,
                     "concepts": concepts,
+                    "residual_labels": residual_labels,
                     "poscon_residuals": poscon_tensor,
                     "negcon_residuals": negcon_tensor,
                     "difference_vectors": difference_tensor,
@@ -143,7 +170,8 @@ def analyze_poscon_negcon_residuals(
         else:
             residual_out_path = residual_path
     else:
-        run_dir = Path(output_dir) / datetime.now().strftime("poscon_negcon_%Y%m%d_%H%M%S")
+        run_prefix = "poscon_negcon" if residual_mode == "generation_prompt" else f"poscon_negcon_{residual_mode}"
+        run_dir = Path(output_dir) / datetime.now().strftime(f"{run_prefix}_%Y%m%d_%H%M%S")
         run_dir.mkdir(parents=True, exist_ok=True)
 
         residual_out_path = run_dir / "poscon_negcon_residuals.pt"
@@ -151,7 +179,9 @@ def analyze_poscon_negcon_residuals(
             {
                 "model": model,
                 "backend": resolved_backend,
+                "residual_mode": residual_mode,
                 "concepts": concepts,
+                "residual_labels": residual_labels,
                 "poscon_residuals": poscon_tensor,
                 "negcon_residuals": negcon_tensor,
                 "difference_vectors": difference_tensor,
@@ -164,6 +194,7 @@ def analyze_poscon_negcon_residuals(
     summary = {
         "model": model,
         "backend": resolved_backend,
+        "residual_mode": residual_mode,
         "dataset": dataset,
         "num_examples": len(rows),
         "best_layer": best_layer,
@@ -191,8 +222,40 @@ def main():
         device_map=args.device_map,
         output_dir=args.output_dir,
         top_k=args.top_k,
+        residual_mode=args.residual_mode,
     )
     print(json.dumps(result["summary"]["top_layers"], indent=2))
+
+
+def build_residual_labels(rows: list[dict], concepts: list[str], residual_mode: str) -> dict[str, list[dict]]:
+    poscon_labels = []
+    negcon_labels = []
+    for index, concept in enumerate(concepts):
+        row = rows[index] if index < len(rows) else {}
+        poscon_labels.append(
+            {
+                "index": index,
+                "concept": concept,
+                "side": "poscon",
+                "class_id": 1,
+                "class_label": row.get("poscon_label") or row.get("positive_label") or "positive",
+                "residual_mode": residual_mode,
+            }
+        )
+        negcon_labels.append(
+            {
+                "index": index,
+                "concept": concept,
+                "side": "negcon",
+                "class_id": 0,
+                "class_label": row.get("negcon_label") or row.get("negative_label") or "negative",
+                "residual_mode": residual_mode,
+            }
+        )
+    return {
+        "poscon": poscon_labels,
+        "negcon": negcon_labels,
+    }
 
 
 def _leave_one_out_centroid_accuracy(poscon_layer: torch.Tensor, negcon_layer: torch.Tensor) -> tuple[float, float]:

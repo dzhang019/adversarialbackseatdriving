@@ -191,6 +191,54 @@ def collect_prompt_last_token_residuals(
     )
 
 
+@torch.no_grad()
+def collect_user_story_last_token_residuals(
+    bundle: TextModelBundle,
+    story: str,
+) -> torch.Tensor:
+    if not story.strip():
+        raise ValueError("Story is empty.")
+    prompt_inputs = encode_chat_prompt(bundle, story, add_generation_prompt=False)
+    input_ids = prompt_inputs["input_ids"]
+    last_story_index = find_user_content_end_index(bundle, story, input_ids[0]) - 1
+    if last_story_index < 0:
+        raise ValueError("Could not locate a story token in the chat-template input.")
+    outputs = bundle.model(
+        input_ids=input_ids,
+        attention_mask=prompt_inputs["attention_mask"],
+        output_hidden_states=True,
+        use_cache=False,
+    )
+    return torch.stack(
+        [hidden_state[0, last_story_index].detach().cpu() for hidden_state in outputs.hidden_states[1:]],
+        dim=0,
+    )
+
+
+@torch.no_grad()
+def collect_user_story_mean_residuals(
+    bundle: TextModelBundle,
+    story: str,
+) -> torch.Tensor:
+    if not story.strip():
+        raise ValueError("Story is empty.")
+    prompt_inputs = encode_chat_prompt(bundle, story, add_generation_prompt=False)
+    input_ids = prompt_inputs["input_ids"]
+    story_start, story_end = find_user_content_span(bundle, story, input_ids[0])
+    if story_end <= story_start:
+        raise ValueError("Could not locate story tokens in the chat-template input.")
+    outputs = bundle.model(
+        input_ids=input_ids,
+        attention_mask=prompt_inputs["attention_mask"],
+        output_hidden_states=True,
+        use_cache=False,
+    )
+    return torch.stack(
+        [hidden_state[0, story_start:story_end].mean(dim=0).detach().cpu() for hidden_state in outputs.hidden_states[1:]],
+        dim=0,
+    )
+
+
 def encode_chat_prompt(
     bundle: TextModelBundle,
     prompt: str,
@@ -243,6 +291,52 @@ def _fallback_chat_prompt_text(tokenizer, prompt: str, add_generation_prompt: bo
     if "llama-2" in name and "chat" in name:
         return f"[INST] {prompt.strip()} [/INST]"
     return prompt
+
+
+def find_user_content_end_index(bundle: TextModelBundle, prompt: str, input_ids: torch.Tensor) -> int:
+    return find_user_content_span(bundle, prompt, input_ids)[1]
+
+
+def find_user_content_span(bundle: TextModelBundle, prompt: str, input_ids: torch.Tensor) -> tuple[int, int]:
+    return find_user_content_start_index(bundle, prompt, input_ids), find_user_content_append_index(bundle, prompt, input_ids)
+
+
+def find_user_content_start_index(bundle: TextModelBundle, prompt: str, input_ids: torch.Tensor) -> int:
+    sentinel = "<LARGO_STORY_CONTENT_BOUNDARY_4d0f2f1e>"
+    extended = encode_chat_prompt(bundle, sentinel + prompt, add_generation_prompt=False)["input_ids"][0]
+    base_tokens = input_ids.tolist()
+    extended_tokens = extended.tolist()
+
+    prefix_length = 0
+    max_prefix_length = min(len(base_tokens), len(extended_tokens))
+    while prefix_length < max_prefix_length and base_tokens[prefix_length] == extended_tokens[prefix_length]:
+        prefix_length += 1
+
+    return prefix_length
+
+
+def find_user_content_append_index(bundle: TextModelBundle, prompt: str, input_ids: torch.Tensor) -> int:
+    sentinel = "<LARGO_STORY_CONTENT_BOUNDARY_4d0f2f1e>"
+    extended = encode_chat_prompt(bundle, prompt + sentinel, add_generation_prompt=False)["input_ids"][0]
+    base_tokens = input_ids.tolist()
+    extended_tokens = extended.tolist()
+
+    prefix_length = 0
+    max_prefix_length = min(len(base_tokens), len(extended_tokens))
+    while prefix_length < max_prefix_length and base_tokens[prefix_length] == extended_tokens[prefix_length]:
+        prefix_length += 1
+
+    base_end = len(base_tokens)
+    extended_end = len(extended_tokens)
+    while (
+        base_end > prefix_length
+        and extended_end > prefix_length
+        and base_tokens[base_end - 1] == extended_tokens[extended_end - 1]
+    ):
+        base_end -= 1
+        extended_end -= 1
+
+    return base_end
 
 
 def load_concepts(path: str | Path) -> list[str]:

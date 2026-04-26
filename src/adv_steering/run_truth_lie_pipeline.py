@@ -6,3 +6,7 @@ if __package__ in (None, ""):
     from adv_steering.run_poscon_negcon_pipeline import *  # noqa: F401,F403
 else:
     from .run_poscon_negcon_pipeline import *  # noqa: F401,F403
+
+
+if __name__ == "__main__":
+    main()

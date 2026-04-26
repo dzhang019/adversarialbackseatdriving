@@ -24,7 +24,7 @@ def parse_args():
     parser.add_argument("--dataset", default="data/llama_happy_sad_corpus.jsonl", help="Generated corpus path.")
     parser.add_argument("--poscon-label", default="happy", help="Positive concept label.")
     parser.add_argument("--negcon-label", default="sad", help="Negative concept label.")
-    parser.add_argument("--mode", default="story", choices=["story", "statement"], help="Prompt style to generate.")
+    parser.add_argument("--mode", default="story", choices=["story", "statement", "truth_lie"], help="Prompt style to generate.")
     parser.add_argument("--dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"])
     parser.add_argument("--device-map", default="auto", help="Transformers device_map value.")
     parser.add_argument("--max-new-tokens", type=int, default=48, help="Maximum number of generated tokens.")
@@ -33,6 +33,21 @@ def parse_args():
     parser.add_argument("--overwrite-dataset", action="store_true", help="Regenerate the dataset from scratch.")
     parser.add_argument("--output-dir", default="runs", help="Directory for analysis outputs.")
     parser.add_argument("--top-k", type=int, default=8, help="How many top layers to export.")
+    parser.add_argument(
+        "--story-only",
+        action="store_true",
+        help="Collect residuals from a user message containing only the story, at the final story token.",
+    )
+    parser.add_argument(
+        "--story-mean",
+        action="store_true",
+        help="Collect residuals from a user message containing only the story, mean-pooled over story tokens.",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Collect residuals for the old assistant-generation-boundary mode, --story-only mode, and --story-mean mode.",
+    )
     return parser.parse_args()
 
 
@@ -55,16 +70,48 @@ def main():
         overwrite=args.overwrite_dataset,
     )
 
-    analysis_result = analyze_poscon_negcon_residuals(
-        model=args.model,
-        backend=args.backend,
-        dataset=args.dataset,
-        dtype=args.dtype,
-        device_map=args.device_map,
-        output_dir=args.output_dir,
-        top_k=args.top_k,
-    )
+    if args.all:
+        residual_modes = ["generation_prompt", "story_only", "story_mean"]
+    elif args.story_mean:
+        residual_modes = ["story_mean"]
+    else:
+        residual_modes = ["story_only" if args.story_only else "generation_prompt"]
+    analyses = {}
+    for residual_mode in residual_modes:
+        analysis_result = analyze_poscon_negcon_residuals(
+            model=args.model,
+            backend=args.backend,
+            dataset=args.dataset,
+            dtype=args.dtype,
+            device_map=args.device_map,
+            output_dir=args.output_dir,
+            top_k=args.top_k,
+            residual_mode=residual_mode,
+        )
+        analyses[residual_mode] = export_steering_candidates(
+            args=args,
+            analysis_result=analysis_result,
+            residual_mode=residual_mode,
+        )
 
+    primary_mode = residual_modes[-1]
+    primary = analyses[primary_mode]
+
+    summary = {
+        "generation": generation_result,
+        "residual_modes": residual_modes,
+        "primary_residual_mode": primary_mode,
+        "analysis_run_dir": primary["analysis_result"]["run_dir"],
+        "best_layer": primary["analysis_result"]["summary"]["best_layer"],
+        "top_layers": primary["analysis_result"]["summary"]["top_layers"],
+        "steering_candidates_json": primary["steering_candidates_json"],
+        "steering_candidates_pt": primary["steering_candidates_pt"],
+        "analyses": analyses,
+    }
+    print(json.dumps(summary, indent=2))
+
+
+def export_steering_candidates(args, analysis_result: dict, residual_mode: str) -> dict:
     residual_payload = torch.load(analysis_result["residual_path"], map_location="cpu")
     steering_vectors = residual_payload["steering_vectors"]
     layer_summary = analysis_result["summary"]["top_layers"]
@@ -92,21 +139,19 @@ def main():
         "model": args.model,
         "backend": args.backend,
         "dataset": args.dataset,
+        "residual_mode": residual_mode,
         "best_layer": analysis_result["summary"]["best_layer"],
         "top_k": args.top_k,
         "candidates": steering_candidates,
     }
-    torch.save(steering_bundle, run_dir / "steering_candidates.pt")
+    steering_candidates_pt = run_dir / "steering_candidates.pt"
+    torch.save(steering_bundle, steering_candidates_pt)
 
-    summary = {
-        "generation": generation_result,
-        "analysis_run_dir": analysis_result["run_dir"],
-        "best_layer": analysis_result["summary"]["best_layer"],
-        "top_layers": analysis_result["summary"]["top_layers"],
+    return {
+        "analysis_result": analysis_result,
         "steering_candidates_json": str(candidates_path),
-        "steering_candidates_pt": str(run_dir / "steering_candidates.pt"),
+        "steering_candidates_pt": str(steering_candidates_pt),
     }
-    print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":

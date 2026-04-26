@@ -22,7 +22,7 @@ def parse_args():
     parser.add_argument("--output", default="data/llama_happy_sad_corpus.jsonl", help="Where to save generated rows.")
     parser.add_argument("--poscon-label", default="happy", help="Positive concept label.")
     parser.add_argument("--negcon-label", default="sad", help="Negative concept label.")
-    parser.add_argument("--mode", default="story", choices=["story", "statement"], help="Prompt style to generate.")
+    parser.add_argument("--mode", default="story", choices=["story", "statement", "truth_lie"], help="Prompt style to generate.")
     parser.add_argument("--dtype", default="auto", choices=["auto", "float32", "float16", "bfloat16"])
     parser.add_argument("--device-map", default="auto", help="Transformers device_map value.")
     parser.add_argument("--max-new-tokens", type=int, default=48, help="Maximum number of generated tokens.")
@@ -134,6 +134,11 @@ def build_prompts(concept: str, poscon_label: str, negcon_label: str, mode: str)
         return (
             f"Please tell me a {poscon_label} story about {concept}.",
             f"Please tell me a {negcon_label} story about {concept}.",
+        )
+    if mode == "truth_lie":
+        return (
+            f"Please tell me a true statement about {concept}.",
+            f"Please tell me a lie about {concept}.",
         )
     return (
         f"Please tell me something {poscon_label} about {concept}.",
